@@ -10,16 +10,15 @@
 #define WM_TRAYICON         (WM_USER + 1)
 #define WM_APP_LOADER_STATE (WM_USER + 2) /* wParam: 0=Hide, 1=Listening, 2=Searching */
 
-#define ID_TRAY_IDENTIFY 1001
-#define ID_TRAY_EXIT     1002
-#define HOTKEY_ID        1
-#define LOADER_TIMER_ID  2
+#define ID_TRAY_IDENTIFY  1001
+#define ID_TRAY_EXIT      1002
+#define IDR_PYTHON_WORKER 101
+#define HOTKEY_ID         1
+#define LOADER_TIMER_ID   2
 
-#define RECORD_SECONDS   4
-#define WAV_FILENAME     "temp.wav"
-
-#define LOADER_W         136
-#define LOADER_H         38
+#define RECORD_SECONDS    4
+#define LOADER_W          136
+#define LOADER_H          38
 
 static NOTIFYICONDATAA g_nid = {0};
 static HWND g_hMainWnd   = NULL;
@@ -28,10 +27,69 @@ static volatile bool g_isRecording = false;
 static int g_loaderPhase = 0; /* 0 = Hidden, 1 = Listening, 2 = Searching */
 static int g_animTick    = 0;
 
-/* Precomputed wave heights for the 4-bar audio animation */
+/* Paths inside %TEMP%\SongFinder so the single .exe leaves zero clutter */
+static char g_workDir[MAX_PATH]       = {0};
+static char g_wavPath[MAX_PATH]       = {0};
+static char g_workerExePath[MAX_PATH] = {0};
+
 static const int kBarWave[8] = { 6, 12, 18, 22, 16, 10, 14, 8 };
 
-/* WASAPI callback: writes captured desktop audio frames into the WAV file */
+/* Initializes %TEMP%\SongFinder paths and extracts the embedded worker .exe if needed */
+bool init_portable_environment(void) {
+    char tempBase[MAX_PATH];
+    DWORD len = GetTempPathA(MAX_PATH, tempBase);
+    if (len == 0 || len > MAX_PATH - 32) {
+        return false;
+    }
+
+    snprintf(g_workDir, sizeof(g_workDir), "%sSongFinder", tempBase);
+    CreateDirectoryA(g_workDir, NULL);
+
+    snprintf(g_wavPath, sizeof(g_wavPath), "%s\\temp.wav", g_workDir);
+    snprintf(g_workerExePath, sizeof(g_workerExePath), "%s\\recognize_ui.exe", g_workDir);
+
+    /* Locate the embedded Python worker inside our own .exe resources */
+    HRSRC hRes = FindResourceA(NULL, MAKEINTRESOURCEA(IDR_PYTHON_WORKER), (LPCSTR)RT_RCDATA);
+    if (!hRes) {
+        return false;
+    }
+
+    DWORD resSize = SizeofResource(NULL, hRes);
+    HGLOBAL hData = LoadResource(NULL, hRes);
+    if (!hData || resSize == 0) {
+        return false;
+    }
+
+    const void* pBytes = LockResource(hData);
+    if (!pBytes) {
+        return false;
+    }
+
+    /* Skip extraction if recognize_ui.exe already exists in %TEMP% with the exact same size */
+    WIN32_FILE_ATTRIBUTE_DATA fileAttr;
+    if (GetFileAttributesExA(g_workerExePath, GetFileExInfoStandard, &fileAttr)) {
+        if (fileAttr.nFileSizeHigh == 0 && fileAttr.nFileSizeLow == resSize) {
+            return true;
+        }
+    }
+
+    /* Extract the embedded worker to %TEMP%\SongFinder\recognize_ui.exe */
+    HANDLE hFile = CreateFileA(
+        g_workerExePath, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(hFile, pBytes, resSize, &written, NULL);
+    CloseHandle(hFile);
+
+    return (ok && written == resSize);
+}
+
+/* WASAPI callback: writes converted 16kHz Mono PCM frames into the WAV file */
 void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
     ma_encoder* pEncoder = (ma_encoder*)pDevice->pUserData;
     if (pEncoder != NULL && pInput != NULL) {
@@ -40,7 +98,7 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
     (void)pOutput;
 }
 
-/* Records N seconds of default Windows playback output */
+/* Records N seconds of Windows desktop audio directly in 16kHz Mono 16-bit PCM */
 bool record_system_audio(const char* filename, int seconds) {
     ma_result result;
     ma_encoder_config encoderConfig;
@@ -48,12 +106,14 @@ bool record_system_audio(const char* filename, int seconds) {
     ma_device_config deviceConfig;
     ma_device device;
 
-    encoderConfig = ma_encoder_config_init(ma_encoding_format_wav, ma_format_s16, 2, 44100);
+    /* 16,000 Hz, 1-Channel (Mono), 16-bit PCM — eliminates the need for ffmpeg */
+    encoderConfig = ma_encoder_config_init(ma_encoding_format_wav, ma_format_s16, 1, 16000);
     result = ma_encoder_init_file(filename, &encoderConfig, &encoder);
     if (result != MA_SUCCESS) {
         return false;
     }
 
+    /* miniaudio automatically downmixes and resamples WASAPI output to match encoderConfig */
     deviceConfig = ma_device_config_init(ma_device_type_loopback);
     deviceConfig.capture.pDeviceID = NULL;
     deviceConfig.capture.format    = encoder.config.format;
@@ -82,10 +142,10 @@ bool record_system_audio(const char* filename, int seconds) {
     return true;
 }
 
-/* Spawns Python worker and returns the process handle so C knows if it exits early */
+/* Spawns the extracted standalone worker .exe */
 HANDLE launch_python_worker(const char* wavPath) {
-    char cmdLine[512];
-    snprintf(cmdLine, sizeof(cmdLine), "python recognize_ui.py \"%s\"", wavPath);
+    char cmdLine[MAX_PATH * 2 + 16];
+    snprintf(cmdLine, sizeof(cmdLine), "\"%s\" \"%s\"", g_workerExePath, wavPath);
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {0};
@@ -104,13 +164,12 @@ DWORD WINAPI capture_thread(LPVOID lpParam) {
     /* Phase 1: Show "Listening..." overlay and capture 4s of audio */
     PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 1, 0);
 
-    if (record_system_audio(WAV_FILENAME, RECORD_SECONDS)) {
-        /* Phase 2: Switch overlay to "Searching..." and run Python */
+    if (record_system_audio(g_wavPath, RECORD_SECONDS)) {
+        /* Phase 2: Switch overlay to "Searching..." and run extracted worker */
         PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 2, 0);
-        HANDLE hProc = launch_python_worker(WAV_FILENAME);
+        HANDLE hProc = launch_python_worker(g_wavPath);
 
         if (hProc != NULL) {
-            /* Wait until Python hides the loader (when popup opens) or exits */
             while (g_loaderPhase != 0) {
                 if (WaitForSingleObject(hProc, 50) == WAIT_OBJECT_0) {
                     break;
@@ -120,7 +179,6 @@ DWORD WINAPI capture_thread(LPVOID lpParam) {
         }
     }
 
-    /* Ensure loader is hidden and unlock new scans */
     PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 0, 0);
     g_isRecording = false;
     return 0;
@@ -133,7 +191,7 @@ void trigger_identification(void) {
     if (hThread) CloseHandle(hThread);
 }
 
-/* Window Procedure for the tiny bottom-right animated equalizer overlay */
+/* Window Procedure for the bottom-right animated equalizer overlay */
 LRESULT CALLBACK LoaderWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_TIMER:
@@ -147,19 +205,16 @@ LRESULT CALLBACK LoaderWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
 
-            /* Double-buffer to prevent any flicker */
             HDC memDC = CreateCompatibleDC(hdc);
             HBITMAP memBmp = CreateCompatibleBitmap(hdc, LOADER_W, LOADER_H);
             HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
 
-            /* Dark background (#18181B) with subtle border (#3F3F46) */
             HBRUSH bgBrush = CreateSolidBrush(RGB(24, 24, 27));
             HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(63, 63, 70));
             HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, bgBrush);
             HPEN oldPen = (HPEN)SelectObject(memDC, borderPen);
             Rectangle(memDC, 0, 0, LOADER_W, LOADER_H);
 
-            /* Draw 4 animated equalizer bars (Red when Listening, Blue when Searching) */
             COLORREF barColor = (g_loaderPhase == 1) ? RGB(239, 68, 68) : RGB(59, 130, 246);
             HBRUSH barBrush = CreateSolidBrush(barColor);
             for (int i = 0; i < 4; i++) {
@@ -171,7 +226,6 @@ LRESULT CALLBACK LoaderWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             }
             DeleteObject(barBrush);
 
-            /* Draw status label ("Listening..." or "Searching...") */
             SetBkMode(memDC, TRANSPARENT);
             SetTextColor(memDC, RGB(228, 228, 231));
             HFONT hFont = CreateFontA(
@@ -185,7 +239,6 @@ LRESULT CALLBACK LoaderWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             const char* label = (g_loaderPhase == 1) ? "Listening..." : "Searching...";
             DrawTextA(memDC, label, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-            /* Blit offscreen buffer to window and clean up GDI objects */
             BitBlt(hdc, 0, 0, LOADER_W, LOADER_H, memDC, 0, 0, SRCCOPY);
 
             SelectObject(memDC, oldFont);
@@ -205,7 +258,7 @@ LRESULT CALLBACK LoaderWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
     return DefWindowProcA(hwnd, uMsg, wParam, lParam);
 }
 
-/* Main hidden window procedure for Tray, Hotkey, and Python IPC messages */
+/* Main hidden window procedure for Tray, Hotkey, and Worker IPC messages */
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
         case WM_APP_LOADER_STATE: {
@@ -216,7 +269,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 KillTimer(g_hLoaderWnd, LOADER_TIMER_ID);
                 ShowWindow(g_hLoaderWnd, SW_HIDE);
             } else {
-                /* Position in bottom-right corner just above the taskbar */
                 RECT workArea;
                 SystemParametersInfoA(SPI_GETWORKAREA, 0, &workArea, 0);
                 int x = workArea.right - LOADER_W - 16;
@@ -277,7 +329,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
 
-    /* Register Main Hidden Host Window Class */
+    if (!init_portable_environment()) {
+        MessageBoxA(NULL, "Failed to extract embedded recognition worker to %TEMP%.", "Song Finder Error", MB_ICONERROR);
+        return 1;
+    }
+
     const char HOST_CLASS[] = "SongFinderTrayClass";
     WNDCLASSA wc = {0};
     wc.lpfnWndProc   = WindowProc;
@@ -285,7 +341,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.lpszClassName = HOST_CLASS;
     RegisterClassA(&wc);
 
-    /* Register Mini Loader Overlay Window Class */
     const char LOADER_CLASS[] = "SongFinderLoaderClass";
     WNDCLASSA lwc = {0};
     lwc.lpfnWndProc   = LoaderWndProc;
@@ -294,10 +349,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     lwc.hCursor       = LoadCursor(NULL, IDC_ARROW);
     RegisterClassA(&lwc);
 
-    /* Hidden top-level window (discoverable by Python via FindWindowW) */
     g_hMainWnd = CreateWindowExA(0, HOST_CLASS, "SongFinderHost", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
 
-    /* Frameless, non-activating bottom-right loader overlay */
     g_hLoaderWnd = CreateWindowExA(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         LOADER_CLASS, "", WS_POPUP,
