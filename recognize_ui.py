@@ -1,5 +1,10 @@
 import sys
 import os
+import warnings
+
+# Silence pydub's top-level ffmpeg warning on clean Windows PCs
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
 import ctypes
 import asyncio
 import urllib.request
@@ -73,12 +78,15 @@ def resolve_youtube_links(artist: str, title: str) -> dict:
 
 
 async def identify_audio(wav_path: str) -> dict:
-    """Runs Shazam acoustic fingerprinting on the recorded WAV file."""
+    """Fingerprints the pre-formatted 16kHz Mono WAV bytes in memory without ffmpeg."""
     shazam = Shazam()
+    with open(wav_path, "rb") as f:
+        wav_bytes = f.read()
+
     if hasattr(shazam, "recognize"):
-        out = await shazam.recognize(wav_path)
+        out = await shazam.recognize(wav_bytes)
     else:
-        out = await shazam.recognize_song(wav_path)
+        out = await shazam.recognize_song(wav_bytes)
 
     track = out.get("track")
     if not track:
@@ -160,7 +168,6 @@ def show_result_window(data: dict):
     container = tk.Frame(root, bg="#18181b", padx=14, pady=14)
     container.pack(fill="both", expand=True)
 
-    # Download Album Cover Art before hiding the C loader so there is no delay
     cover_photo = None
     if data.get("cover_url"):
         try:
@@ -172,7 +179,6 @@ def show_result_window(data: dict):
         except Exception:
             cover_photo = None
 
-    # Hide the C loading indicator right as the result card is ready to render
     notify_host_hide_loader()
 
     if cover_photo:
