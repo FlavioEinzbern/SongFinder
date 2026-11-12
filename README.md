@@ -14,11 +14,8 @@ download the latest "w64devkit-x64-xxxx.7z.exe" from the following link, extract
 https://github.com/skeeto/w64devkit/releases
 
 Open the command prompt (cmd) in the target folder and execute the following commands:
-{
-curl -L -o miniaudio.h https://raw.githubusercontent.com/mackron/miniaudio/master/miniaudio.h
-
-pip install shazamio ytmusicapi pillow
-
-}
+"curl -L -o miniaudio.h https://raw.githubusercontent.com/mackron/miniaudio/master/miniaudio.h"
+"pip install shazamio ytmusicapi pillow"
+"pip install pyinstaller"
 
 Now run the "build.bat" and it should create a file "song_finder.exe"
