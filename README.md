@@ -17,5 +17,6 @@ Open the command prompt (cmd) in the target folder and execute the following com
 "curl -L -o miniaudio.h https://raw.githubusercontent.com/mackron/miniaudio/master/miniaudio.h"
 "pip install shazamio ytmusicapi pillow"
 "pip install pyinstaller"
+"pip install SpeechRecognition"
 
 Now run the "build.bat" and it should create a file "song_finder.exe"
