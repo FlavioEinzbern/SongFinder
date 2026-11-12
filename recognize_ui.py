@@ -1,5 +1,6 @@
 import sys
 import os
+import ctypes
 import asyncio
 import urllib.request
 import urllib.parse
@@ -9,6 +10,25 @@ import tkinter as tk
 from PIL import Image, ImageTk
 from shazamio import Shazam
 from ytmusicapi import YTMusic
+
+# Win32 message constants matching host_tray.c
+WM_COMMAND          = 0x0111
+WM_APP_LOADER_STATE = 0x0400 + 2  # WM_USER + 2
+ID_TRAY_IDENTIFY    = 1001
+
+
+def notify_host_hide_loader():
+    """Tells the C host to hide the bottom-right loading pill immediately."""
+    hwnd = ctypes.windll.user32.FindWindowW("SongFinderTrayClass", "SongFinderHost")
+    if hwnd:
+        ctypes.windll.user32.PostMessageW(hwnd, WM_APP_LOADER_STATE, 0, 0)
+
+
+def notify_host_retry():
+    """Tells the C host to start a fresh 4-second audio capture immediately."""
+    hwnd = ctypes.windll.user32.FindWindowW("SongFinderTrayClass", "SongFinderHost")
+    if hwnd:
+        ctypes.windll.user32.PostMessageW(hwnd, WM_COMMAND, ID_TRAY_IDENTIFY, 0)
 
 
 def extract_album_from_shazam(track_data: dict) -> str:
@@ -86,34 +106,61 @@ async def identify_audio(wav_path: str) -> dict:
 
 
 def show_result_window(data: dict):
-    """Renders a lightweight desktop card with the album cover and YouTube buttons."""
+    """Renders a desktop card with album art, YouTube links, and Try Again button."""
     root = tk.Tk()
     root.title("Song Identified" if data.get("found") else "No Match Found")
     root.configure(bg="#18181b")
     root.resizable(False, False)
     root.attributes("-topmost", True)
 
-    # Position window near bottom-right of the screen
-    win_w, win_h = 420, 210
+    win_w, win_h = 440, 210
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
     root.geometry(f"{win_w}x{win_h}+{screen_w - win_w - 24}+{screen_h - win_h - 64}")
 
+    def open_link_and_close(url: str):
+        webbrowser.open(url)
+        root.destroy()
+
+    def retry_and_close():
+        root.destroy()
+        notify_host_retry()
+
     if not data.get("found"):
-        lbl = tk.Label(
-            root,
-            text="Could not identify the playing audio.\nMake sure music is playing clearly and try again.",
+        notify_host_hide_loader()
+        container = tk.Frame(root, bg="#18181b", padx=20, pady=20)
+        container.pack(fill="both", expand=True)
+
+        tk.Label(
+            container,
+            text="Could not identify the playing audio.\nMake sure the song is playing clearly.",
             fg="#e4e4e7", bg="#18181b", font=("Segoe UI", 10), justify="center"
-        )
-        lbl.pack(expand=True, padx=20, pady=20)
-        root.after(5000, root.destroy)
+        ).pack(expand=True, pady=(10, 14))
+
+        btn_row = tk.Frame(container, bg="#18181b")
+        btn_row.pack()
+
+        tk.Button(
+            btn_row, text="Try Again", bg="#3b82f6", fg="#ffffff",
+            activebackground="#2563eb", activeforeground="#ffffff",
+            font=("Segoe UI", 9, "bold"), relief="flat", padx=14, pady=6, cursor="hand2",
+            command=retry_and_close
+        ).pack(side="left", padx=6)
+
+        tk.Button(
+            btn_row, text="Close", bg="#27272a", fg="#e4e4e7",
+            activebackground="#3f3f46", activeforeground="#ffffff",
+            font=("Segoe UI", 9), relief="flat", padx=14, pady=6, cursor="hand2",
+            command=root.destroy
+        ).pack(side="left", padx=6)
+
         root.mainloop()
         return
 
     container = tk.Frame(root, bg="#18181b", padx=14, pady=14)
     container.pack(fill="both", expand=True)
 
-    # Load Album Cover Art
+    # Download Album Cover Art before hiding the C loader so there is no delay
     cover_photo = None
     if data.get("cover_url"):
         try:
@@ -125,6 +172,9 @@ def show_result_window(data: dict):
         except Exception:
             cover_photo = None
 
+    # Hide the C loading indicator right as the result card is ready to render
+    notify_host_hide_loader()
+
     if cover_photo:
         img_label = tk.Label(container, image=cover_photo, bg="#27272a", bd=0)
         img_label.image = cover_photo
@@ -135,17 +185,17 @@ def show_result_window(data: dict):
 
     tk.Label(
         info_frame, text=data["title"], fg="#ffffff", bg="#18181b",
-        font=("Segoe UI", 12, "bold"), anchor="w", wraplength=230, justify="left"
+        font=("Segoe UI", 12, "bold"), anchor="w", wraplength=250, justify="left"
     ).pack(fill="x")
 
     tk.Label(
         info_frame, text=data["artist"], fg="#a1a1aa", bg="#18181b",
-        font=("Segoe UI", 10), anchor="w", wraplength=230, justify="left"
+        font=("Segoe UI", 10), anchor="w", wraplength=250, justify="left"
     ).pack(fill="x", pady=(2, 0))
 
     tk.Label(
         info_frame, text=f"Album: {data['album']}", fg="#71717a", bg="#18181b",
-        font=("Segoe UI", 9), anchor="w", wraplength=230, justify="left"
+        font=("Segoe UI", 9), anchor="w", wraplength=250, justify="left"
     ).pack(fill="x", pady=(2, 12))
 
     btn_frame = tk.Frame(info_frame, bg="#18181b")
@@ -154,15 +204,22 @@ def show_result_window(data: dict):
     tk.Button(
         btn_frame, text="YouTube", bg="#ef4444", fg="#ffffff",
         activebackground="#dc2626", activeforeground="#ffffff",
-        font=("Segoe UI", 9, "bold"), relief="flat", padx=10, pady=5, cursor="hand2",
-        command=lambda: webbrowser.open(data["yt_url"])
-    ).pack(side="left", padx=(0, 8))
+        font=("Segoe UI", 9, "bold"), relief="flat", padx=9, pady=5, cursor="hand2",
+        command=lambda: open_link_and_close(data["yt_url"])
+    ).pack(side="left", padx=(0, 6))
 
     tk.Button(
         btn_frame, text="YT Music", bg="#27272a", fg="#ffffff",
         activebackground="#3f3f46", activeforeground="#ffffff",
-        font=("Segoe UI", 9, "bold"), relief="flat", padx=10, pady=5, cursor="hand2",
-        command=lambda: webbrowser.open(data["ytm_url"])
+        font=("Segoe UI", 9, "bold"), relief="flat", padx=9, pady=5, cursor="hand2",
+        command=lambda: open_link_and_close(data["ytm_url"])
+    ).pack(side="left", padx=(0, 6))
+
+    tk.Button(
+        btn_frame, text="Try Again", bg="#3b82f6", fg="#ffffff",
+        activebackground="#2563eb", activeforeground="#ffffff",
+        font=("Segoe UI", 9, "bold"), relief="flat", padx=9, pady=5, cursor="hand2",
+        command=retry_and_close
     ).pack(side="left")
 
     root.mainloop()
@@ -171,6 +228,7 @@ def show_result_window(data: dict):
 def main():
     wav_path = sys.argv[1] if len(sys.argv) > 1 else "temp.wav"
     if not os.path.exists(wav_path):
+        notify_host_hide_loader()
         sys.exit(1)
 
     try:
@@ -178,7 +236,6 @@ def main():
     except Exception:
         data = {"found": False}
     finally:
-        # Clean up the temporary WAV file immediately
         if os.path.exists(wav_path):
             try:
                 os.remove(wav_path)
