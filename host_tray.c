@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -9,7 +10,7 @@
 #include "miniaudio.h"
 
 #define WM_TRAYICON         (WM_USER + 1)
-#define WM_APP_LOADER_STATE (WM_USER + 2) /* wParam: 0=Hide, 1=Listening, 2=Searching, 3=Loading */
+#define WM_APP_LOADER_STATE (WM_USER + 2) /* wParam: 0=Hide, 1=Listening, 2=Searching, 3=Loading, 4=Deep Listen */
 
 #define ID_TRAY_IDENTIFY    1001
 #define ID_TRAY_EXIT        1002
@@ -21,7 +22,7 @@
 #define LOADER_TIMER_ID     2
 
 #define RECORD_SECONDS      4
-#define LOADER_W            136
+#define LOADER_W            142
 #define LOADER_H            38
 
 static NOTIFYICONDATAA g_nid = {0};
@@ -29,10 +30,11 @@ static HWND g_hMainWnd   = NULL;
 static HWND g_hLoaderWnd = NULL;
 static volatile bool g_isBusy = false;
 static bool g_useNativePython = false;
-static int g_loaderPhase = 0; /* 0=Hidden, 1=Listening, 2=Searching, 3=Loading */
+static int g_loaderPhase = 0; /* 0=Hidden, 1=Listening, 2=Searching, 3=Loading, 4=Deep Listen */
 static int g_animTick    = 0;
 
 /* Paths inside %TEMP%\SongFinder */
+static char g_selfExePath[MAX_PATH]   = {0};
 static char g_workDir[MAX_PATH]       = {0};
 static char g_wavPath[MAX_PATH]       = {0};
 static char g_scriptPath[MAX_PATH]    = {0};
@@ -102,9 +104,9 @@ static bool run_silent_command(const char* cmdLine) {
     return (exitCode == 0);
 }
 
-/* Checks if the PC already has Python + shazamio, ytmusicapi, Pillow, and tkinter */
+/* Checks if the PC already has Python + all required packages including speech_recognition */
 static bool check_native_python_deps(void) {
-    return run_silent_command("python -c \"import shazamio, ytmusicapi, PIL, tkinter\"");
+    return run_silent_command("python -c \"import shazamio, ytmusicapi, PIL, tkinter, speech_recognition\"");
 }
 
 /* Extracts and unpacks the --onedir worker archive into %TEMP%\SongFinder\recognize_ui\ */
@@ -171,22 +173,19 @@ DWORD WINAPI startup_init_thread(LPVOID lpParam) {
     DWORD scriptSize  = get_resource_size(IDR_PYTHON_SCRIPT);
     DWORD archiveSize = get_resource_size(IDR_WORKER_ARCHIVE);
 
-    /* Fast path (0ms): already initialized for this build */
+    /* Always keep recognize_ui.py updated in %TEMP% if size changed */
     if (load_valid_mode_cache(scriptSize, archiveSize)) {
         g_isBusy = false;
         return 0;
     }
 
-    /* Show "Loading..." overlay in bottom-right corner */
     PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 3, 0);
-
-    /* Always extract the tiny 7KB recognize_ui.py script */
     extract_resource_to_file(IDR_PYTHON_SCRIPT, g_scriptPath);
 
     if (check_native_python_deps()) {
         g_useNativePython = true;
         save_mode_cache(1, scriptSize, archiveSize);
-        Sleep(300); /* Brief visual confirmation of the Loading pill */
+        Sleep(300);
     } else {
         if (extract_onedir_worker()) {
             g_useNativePython = false;
@@ -252,13 +251,13 @@ bool record_system_audio(const char* filename, int seconds) {
     return true;
 }
 
-/* Spawns either native Python or the extracted --onedir worker executable */
+/* Spawns Python worker and passes both temp.wav and song_finder.exe's path (for Backup 1 CLI capture) */
 HANDLE launch_python_worker(const char* wavPath) {
-    char cmdLine[MAX_PATH * 2 + 32];
+    char cmdLine[MAX_PATH * 3 + 32];
     if (g_useNativePython) {
-        snprintf(cmdLine, sizeof(cmdLine), "python \"%s\" \"%s\"", g_scriptPath, wavPath);
+        snprintf(cmdLine, sizeof(cmdLine), "python \"%s\" \"%s\" \"%s\"", g_scriptPath, wavPath, g_selfExePath);
     } else {
-        snprintf(cmdLine, sizeof(cmdLine), "\"%s\" \"%s\"", g_workerExePath, wavPath);
+        snprintf(cmdLine, sizeof(cmdLine), "\"%s\" \"%s\" \"%s\"", g_workerExePath, wavPath, g_selfExePath);
     }
 
     STARTUPINFOA si = { sizeof(si) };
@@ -271,11 +270,11 @@ HANDLE launch_python_worker(const char* wavPath) {
     return NULL;
 }
 
-/* Background thread for recording and monitoring the lookup phase */
+/* Background thread for recording and monitoring the full lookup/fallback chain */
 DWORD WINAPI capture_thread(LPVOID lpParam) {
     (void)lpParam;
 
-    /* Phase 1: Show "Listening..." overlay and capture 4s of audio */
+    /* Phase 1: Show "Listening..." overlay and capture initial 4s of audio */
     PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 1, 0);
 
     if (record_system_audio(g_wavPath, RECORD_SECONDS)) {
@@ -340,10 +339,11 @@ LRESULT CALLBACK LoaderWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             HPEN oldPen = (HPEN)SelectObject(memDC, borderPen);
             Rectangle(memDC, 0, 0, LOADER_W, LOADER_H);
 
-            /* Bar colors: 1=Red (Listening), 2=Blue (Searching), 3=Amber (Loading) */
+            /* Bar colors: 1=Red (Listening), 2=Blue (Searching), 3=Amber (Loading), 4=Purple (Deep Listen) */
             COLORREF barColor = RGB(59, 130, 246);
             if (g_loaderPhase == 1) barColor = RGB(239, 68, 68);
             else if (g_loaderPhase == 3) barColor = RGB(245, 158, 11);
+            else if (g_loaderPhase == 4) barColor = RGB(168, 85, 247);
 
             HBRUSH barBrush = CreateSolidBrush(barColor);
             for (int i = 0; i < 4; i++) {
@@ -368,6 +368,7 @@ LRESULT CALLBACK LoaderWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             const char* label = "Searching...";
             if (g_loaderPhase == 1) label = "Listening...";
             else if (g_loaderPhase == 3) label = "Loading...";
+            else if (g_loaderPhase == 4) label = "Deep Listen...";
 
             DrawTextA(memDC, label, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
@@ -459,7 +460,34 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
-    (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
+    (void)hPrevInstance; (void)nCmdShow;
+
+    /* Backup 1 CLI Audio Engine Mode: song_finder.exe --capture <seconds> "<wav_path>" */
+    if (lpCmdLine && strncmp(lpCmdLine, "--capture", 9) == 0) {
+        int sec = 8;
+        char outWav[MAX_PATH] = {0};
+        const char* p = lpCmdLine + 9;
+        while (*p == ' ') p++;
+        if (*p >= '0' && *p <= '9') {
+            sec = atoi(p);
+            while (*p && *p != ' ') p++;
+            while (*p == ' ') p++;
+        }
+        if (*p == '"') {
+            p++;
+            strncpy(outWav, p, MAX_PATH - 1);
+            char* q = strchr(outWav, '"');
+            if (q) *q = '\0';
+        } else if (*p) {
+            strncpy(outWav, p, MAX_PATH - 1);
+        }
+        if (outWav[0] != '\0' && sec > 0 && sec <= 30) {
+            return record_system_audio(outWav, sec) ? 0 : 1;
+        }
+        return 1;
+    }
+
+    GetModuleFileNameA(NULL, g_selfExePath, MAX_PATH);
 
     /* Initialize %TEMP%\SongFinder file paths */
     char tempBase[MAX_PATH];
@@ -511,7 +539,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     strncpy(g_nid.szTip, "Song Finder (Click or press Ctrl+Alt+S)", sizeof(g_nid.szTip) - 1);
     Shell_NotifyIconA(NIM_ADD, &g_nid);
 
-    /* Run dependency scan / fallback extraction asynchronously so "Loading..." animates smoothly */
     g_isBusy = true;
     HANDLE hInitThread = CreateThread(NULL, 0, startup_init_thread, NULL, 0, NULL);
     if (hInitThread) CloseHandle(hInitThread);
