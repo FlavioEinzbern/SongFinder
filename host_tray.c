@@ -3,90 +3,202 @@
 #include <shellapi.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
 
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
 #define WM_TRAYICON         (WM_USER + 1)
-#define WM_APP_LOADER_STATE (WM_USER + 2) /* wParam: 0=Hide, 1=Listening, 2=Searching */
+#define WM_APP_LOADER_STATE (WM_USER + 2) /* wParam: 0=Hide, 1=Listening, 2=Searching, 3=Loading */
 
-#define ID_TRAY_IDENTIFY  1001
-#define ID_TRAY_EXIT      1002
-#define IDR_PYTHON_WORKER 101
-#define HOTKEY_ID         1
-#define LOADER_TIMER_ID   2
+#define ID_TRAY_IDENTIFY    1001
+#define ID_TRAY_EXIT        1002
 
-#define RECORD_SECONDS    4
-#define LOADER_W          136
-#define LOADER_H          38
+#define IDR_PYTHON_SCRIPT   101
+#define IDR_WORKER_ARCHIVE  102
+
+#define HOTKEY_ID           1
+#define LOADER_TIMER_ID     2
+
+#define RECORD_SECONDS      4
+#define LOADER_W            136
+#define LOADER_H            38
 
 static NOTIFYICONDATAA g_nid = {0};
 static HWND g_hMainWnd   = NULL;
 static HWND g_hLoaderWnd = NULL;
-static volatile bool g_isRecording = false;
-static int g_loaderPhase = 0; /* 0 = Hidden, 1 = Listening, 2 = Searching */
+static volatile bool g_isBusy = false;
+static bool g_useNativePython = false;
+static int g_loaderPhase = 0; /* 0=Hidden, 1=Listening, 2=Searching, 3=Loading */
 static int g_animTick    = 0;
 
-/* Paths inside %TEMP%\SongFinder so the single .exe leaves zero clutter */
+/* Paths inside %TEMP%\SongFinder */
 static char g_workDir[MAX_PATH]       = {0};
 static char g_wavPath[MAX_PATH]       = {0};
+static char g_scriptPath[MAX_PATH]    = {0};
+static char g_archivePath[MAX_PATH]   = {0};
 static char g_workerExePath[MAX_PATH] = {0};
+static char g_modeCfgPath[MAX_PATH]   = {0};
 
 static const int kBarWave[8] = { 6, 12, 18, 22, 16, 10, 14, 8 };
 
-/* Initializes %TEMP%\SongFinder paths and extracts the embedded worker .exe if needed */
-bool init_portable_environment(void) {
-    char tempBase[MAX_PATH];
-    DWORD len = GetTempPathA(MAX_PATH, tempBase);
-    if (len == 0 || len > MAX_PATH - 32) {
-        return false;
-    }
+/* Helper: Checks if a file exists on disk */
+static bool file_exists(const char* path) {
+    DWORD attr = GetFileAttributesA(path);
+    return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
+}
 
-    snprintf(g_workDir, sizeof(g_workDir), "%sSongFinder", tempBase);
-    CreateDirectoryA(g_workDir, NULL);
+/* Helper: Returns the byte size of an embedded RCDATA resource */
+static DWORD get_resource_size(int resId) {
+    HRSRC hRes = FindResourceA(NULL, MAKEINTRESOURCEA(resId), (LPCSTR)RT_RCDATA);
+    if (!hRes) return 0;
+    return SizeofResource(NULL, hRes);
+}
 
-    snprintf(g_wavPath, sizeof(g_wavPath), "%s\\temp.wav", g_workDir);
-    snprintf(g_workerExePath, sizeof(g_workerExePath), "%s\\recognize_ui.exe", g_workDir);
-
-    /* Locate the embedded Python worker inside our own .exe resources */
-    HRSRC hRes = FindResourceA(NULL, MAKEINTRESOURCEA(IDR_PYTHON_WORKER), (LPCSTR)RT_RCDATA);
-    if (!hRes) {
-        return false;
-    }
+/* Helper: Extracts an embedded RCDATA resource to a file on disk */
+static bool extract_resource_to_file(int resId, const char* destPath) {
+    HRSRC hRes = FindResourceA(NULL, MAKEINTRESOURCEA(resId), (LPCSTR)RT_RCDATA);
+    if (!hRes) return false;
 
     DWORD resSize = SizeofResource(NULL, hRes);
     HGLOBAL hData = LoadResource(NULL, hRes);
-    if (!hData || resSize == 0) {
-        return false;
-    }
+    if (!hData || resSize == 0) return false;
 
     const void* pBytes = LockResource(hData);
-    if (!pBytes) {
-        return false;
-    }
+    if (!pBytes) return false;
 
-    /* Skip extraction if recognize_ui.exe already exists in %TEMP% with the exact same size */
-    WIN32_FILE_ATTRIBUTE_DATA fileAttr;
-    if (GetFileAttributesExA(g_workerExePath, GetFileExInfoStandard, &fileAttr)) {
-        if (fileAttr.nFileSizeHigh == 0 && fileAttr.nFileSizeLow == resSize) {
-            return true;
-        }
-    }
-
-    /* Extract the embedded worker to %TEMP%\SongFinder\recognize_ui.exe */
     HANDLE hFile = CreateFileA(
-        g_workerExePath, GENERIC_WRITE, 0, NULL,
+        destPath, GENERIC_WRITE, 0, NULL,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL
     );
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return false;
-    }
+    if (hFile == INVALID_HANDLE_VALUE) return false;
 
     DWORD written = 0;
     BOOL ok = WriteFile(hFile, pBytes, resSize, &written, NULL);
     CloseHandle(hFile);
 
     return (ok && written == resSize);
+}
+
+/* Helper: Runs a command silently and returns true if it exits with code 0 */
+static bool run_silent_command(const char* cmdLine) {
+    char mutableCmd[1024];
+    strncpy(mutableCmd, cmdLine, sizeof(mutableCmd) - 1);
+    mutableCmd[sizeof(mutableCmd) - 1] = '\0';
+
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {0};
+
+    if (!CreateProcessA(NULL, mutableCmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (exitCode == 0);
+}
+
+/* Checks if the PC already has Python + shazamio, ytmusicapi, Pillow, and tkinter */
+static bool check_native_python_deps(void) {
+    return run_silent_command("python -c \"import shazamio, ytmusicapi, PIL, tkinter\"");
+}
+
+/* Extracts and unpacks the --onedir worker archive into %TEMP%\SongFinder\recognize_ui\ */
+static bool extract_onedir_worker(void) {
+    if (!extract_resource_to_file(IDR_WORKER_ARCHIVE, g_archivePath)) {
+        return false;
+    }
+
+    char tarCmd[MAX_PATH * 2 + 64];
+    snprintf(tarCmd, sizeof(tarCmd), "tar.exe -xf \"%s\" -C \"%s\"", g_archivePath, g_workDir);
+    bool ok = run_silent_command(tarCmd);
+
+    DeleteFileA(g_archivePath);
+    return (ok && file_exists(g_workerExePath));
+}
+
+/* Saves the active mode (1=Native Python, 2=Standalone Worker) + build signature */
+static void save_mode_cache(int mode, DWORD scriptSize, DWORD archiveSize) {
+    char buf[128];
+    int len = snprintf(buf, sizeof(buf), "%d:%lu:%lu", mode, (unsigned long)scriptSize, (unsigned long)archiveSize);
+    HANDLE hFile = CreateFileA(g_modeCfgPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(hFile, buf, (DWORD)len, &written, NULL);
+        CloseHandle(hFile);
+    }
+}
+
+/* Checks if %TEMP%\SongFinder\mode.cfg matches current build and files exist */
+static bool load_valid_mode_cache(DWORD scriptSize, DWORD archiveSize) {
+    HANDLE hFile = CreateFileA(g_modeCfgPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    char buf[128] = {0};
+    DWORD bytesRead = 0;
+    ReadFile(hFile, buf, sizeof(buf) - 1, &bytesRead, NULL);
+    CloseHandle(hFile);
+
+    int mode = 0;
+    unsigned long cachedScript = 0, cachedArchive = 0;
+    if (sscanf(buf, "%d:%lu:%lu", &mode, &cachedScript, &cachedArchive) != 3) {
+        return false;
+    }
+
+    if (cachedScript != scriptSize || cachedArchive != archiveSize) {
+        return false;
+    }
+
+    if (mode == 1 && file_exists(g_scriptPath)) {
+        g_useNativePython = true;
+        return true;
+    }
+    if (mode == 2 && file_exists(g_workerExePath)) {
+        g_useNativePython = false;
+        return true;
+    }
+    return false;
+}
+
+/* Background startup thread: checks cache or shows "Loading..." while setting up */
+DWORD WINAPI startup_init_thread(LPVOID lpParam) {
+    (void)lpParam;
+
+    DWORD scriptSize  = get_resource_size(IDR_PYTHON_SCRIPT);
+    DWORD archiveSize = get_resource_size(IDR_WORKER_ARCHIVE);
+
+    /* Fast path (0ms): already initialized for this build */
+    if (load_valid_mode_cache(scriptSize, archiveSize)) {
+        g_isBusy = false;
+        return 0;
+    }
+
+    /* Show "Loading..." overlay in bottom-right corner */
+    PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 3, 0);
+
+    /* Always extract the tiny 7KB recognize_ui.py script */
+    extract_resource_to_file(IDR_PYTHON_SCRIPT, g_scriptPath);
+
+    if (check_native_python_deps()) {
+        g_useNativePython = true;
+        save_mode_cache(1, scriptSize, archiveSize);
+        Sleep(300); /* Brief visual confirmation of the Loading pill */
+    } else {
+        if (extract_onedir_worker()) {
+            g_useNativePython = false;
+            save_mode_cache(2, scriptSize, archiveSize);
+        } else {
+            MessageBoxA(NULL, "Failed to unpack standalone worker to %TEMP%.", "Song Finder Error", MB_ICONERROR);
+        }
+    }
+
+    PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 0, 0);
+    g_isBusy = false;
+    return 0;
 }
 
 /* WASAPI callback: writes converted 16kHz Mono PCM frames into the WAV file */
@@ -106,14 +218,12 @@ bool record_system_audio(const char* filename, int seconds) {
     ma_device_config deviceConfig;
     ma_device device;
 
-    /* 16,000 Hz, 1-Channel (Mono), 16-bit PCM — eliminates the need for ffmpeg */
     encoderConfig = ma_encoder_config_init(ma_encoding_format_wav, ma_format_s16, 1, 16000);
     result = ma_encoder_init_file(filename, &encoderConfig, &encoder);
     if (result != MA_SUCCESS) {
         return false;
     }
 
-    /* miniaudio automatically downmixes and resamples WASAPI output to match encoderConfig */
     deviceConfig = ma_device_config_init(ma_device_type_loopback);
     deviceConfig.capture.pDeviceID = NULL;
     deviceConfig.capture.format    = encoder.config.format;
@@ -142,10 +252,14 @@ bool record_system_audio(const char* filename, int seconds) {
     return true;
 }
 
-/* Spawns the extracted standalone worker .exe */
+/* Spawns either native Python or the extracted --onedir worker executable */
 HANDLE launch_python_worker(const char* wavPath) {
-    char cmdLine[MAX_PATH * 2 + 16];
-    snprintf(cmdLine, sizeof(cmdLine), "\"%s\" \"%s\"", g_workerExePath, wavPath);
+    char cmdLine[MAX_PATH * 2 + 32];
+    if (g_useNativePython) {
+        snprintf(cmdLine, sizeof(cmdLine), "python \"%s\" \"%s\"", g_scriptPath, wavPath);
+    } else {
+        snprintf(cmdLine, sizeof(cmdLine), "\"%s\" \"%s\"", g_workerExePath, wavPath);
+    }
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {0};
@@ -165,9 +279,20 @@ DWORD WINAPI capture_thread(LPVOID lpParam) {
     PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 1, 0);
 
     if (record_system_audio(g_wavPath, RECORD_SECONDS)) {
-        /* Phase 2: Switch overlay to "Searching..." and run extracted worker */
+        /* Phase 2: Switch overlay to "Searching..." and launch worker */
         PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 2, 0);
         HANDLE hProc = launch_python_worker(g_wavPath);
+
+        /* Safety Fallback: If native Python was uninstalled after caching, unpack worker now */
+        if (hProc == NULL && g_useNativePython) {
+            PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 3, 0);
+            if (extract_onedir_worker()) {
+                g_useNativePython = false;
+                save_mode_cache(2, get_resource_size(IDR_PYTHON_SCRIPT), get_resource_size(IDR_WORKER_ARCHIVE));
+                PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 2, 0);
+                hProc = launch_python_worker(g_wavPath);
+            }
+        }
 
         if (hProc != NULL) {
             while (g_loaderPhase != 0) {
@@ -180,13 +305,13 @@ DWORD WINAPI capture_thread(LPVOID lpParam) {
     }
 
     PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 0, 0);
-    g_isRecording = false;
+    g_isBusy = false;
     return 0;
 }
 
 void trigger_identification(void) {
-    if (g_isRecording) return;
-    g_isRecording = true;
+    if (g_isBusy) return;
+    g_isBusy = true;
     HANDLE hThread = CreateThread(NULL, 0, capture_thread, NULL, 0, NULL);
     if (hThread) CloseHandle(hThread);
 }
@@ -215,7 +340,11 @@ LRESULT CALLBACK LoaderWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             HPEN oldPen = (HPEN)SelectObject(memDC, borderPen);
             Rectangle(memDC, 0, 0, LOADER_W, LOADER_H);
 
-            COLORREF barColor = (g_loaderPhase == 1) ? RGB(239, 68, 68) : RGB(59, 130, 246);
+            /* Bar colors: 1=Red (Listening), 2=Blue (Searching), 3=Amber (Loading) */
+            COLORREF barColor = RGB(59, 130, 246);
+            if (g_loaderPhase == 1) barColor = RGB(239, 68, 68);
+            else if (g_loaderPhase == 3) barColor = RGB(245, 158, 11);
+
             HBRUSH barBrush = CreateSolidBrush(barColor);
             for (int i = 0; i < 4; i++) {
                 int h = kBarWave[(g_animTick + i * 2) % 8];
@@ -236,7 +365,10 @@ LRESULT CALLBACK LoaderWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPara
             HFONT oldFont = (HFONT)SelectObject(memDC, hFont);
 
             RECT textRect = { 44, 0, LOADER_W - 6, LOADER_H };
-            const char* label = (g_loaderPhase == 1) ? "Listening..." : "Searching...";
+            const char* label = "Searching...";
+            if (g_loaderPhase == 1) label = "Listening...";
+            else if (g_loaderPhase == 3) label = "Loading...";
+
             DrawTextA(memDC, label, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
             BitBlt(hdc, 0, 0, LOADER_W, LOADER_H, memDC, 0, 0, SRCCOPY);
@@ -329,10 +461,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
 
-    if (!init_portable_environment()) {
-        MessageBoxA(NULL, "Failed to extract embedded recognition worker to %TEMP%.", "Song Finder Error", MB_ICONERROR);
+    /* Initialize %TEMP%\SongFinder file paths */
+    char tempBase[MAX_PATH];
+    DWORD len = GetTempPathA(MAX_PATH, tempBase);
+    if (len == 0 || len > MAX_PATH - 48) {
         return 1;
     }
+    snprintf(g_workDir, sizeof(g_workDir), "%sSongFinder", tempBase);
+    CreateDirectoryA(g_workDir, NULL);
+
+    snprintf(g_wavPath, sizeof(g_wavPath), "%s\\temp.wav", g_workDir);
+    snprintf(g_scriptPath, sizeof(g_scriptPath), "%s\\recognize_ui.py", g_workDir);
+    snprintf(g_archivePath, sizeof(g_archivePath), "%s\\worker_pkg.zip", g_workDir);
+    snprintf(g_workerExePath, sizeof(g_workerExePath), "%s\\recognize_ui\\recognize_ui.exe", g_workDir);
+    snprintf(g_modeCfgPath, sizeof(g_modeCfgPath), "%s\\mode.cfg", g_workDir);
 
     const char HOST_CLASS[] = "SongFinderTrayClass";
     WNDCLASSA wc = {0};
@@ -368,6 +510,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_nid.hIcon            = LoadIcon(NULL, IDI_APPLICATION);
     strncpy(g_nid.szTip, "Song Finder (Click or press Ctrl+Alt+S)", sizeof(g_nid.szTip) - 1);
     Shell_NotifyIconA(NIM_ADD, &g_nid);
+
+    /* Run dependency scan / fallback extraction asynchronously so "Loading..." animates smoothly */
+    g_isBusy = true;
+    HANDLE hInitThread = CreateThread(NULL, 0, startup_init_thread, NULL, 0, NULL);
+    if (hInitThread) CloseHandle(hInitThread);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
