@@ -23,8 +23,7 @@
 #define HOTKEY_ID           1
 #define LOADER_TIMER_ID     2
 
-#define RECORD_SHORT_SEC    5
-#define RECORD_DEEP_SEC     10
+#define RECORD_MAX_SEC      12
 
 #define LOADER_W            146
 #define LOADER_H_COMPACT    38
@@ -32,11 +31,9 @@
 
 typedef struct {
     CRITICAL_SECTION cs;
-    ma_encoder encShort;
-    ma_encoder encDeep;
-    bool shortOpen;
-    bool deepOpen;
-} DualCaptureContext;
+    HANDLE hFile;
+    bool isOpen;
+} StreamCaptureContext;
 
 static NOTIFYICONDATAA g_nid = {0};
 static HWND g_hMainWnd   = NULL;
@@ -50,9 +47,7 @@ static bool g_cancelHover = false;
 
 /* Paths inside %TEMP%\SongFinder */
 static char g_workDir[MAX_PATH]       = {0};
-static char g_wavPath[MAX_PATH]       = {0};
-static char g_deepWritePath[MAX_PATH] = {0};
-static char g_deepReadyPath[MAX_PATH] = {0};
+static char g_pcmPath[MAX_PATH]       = {0};
 static char g_scriptPath[MAX_PATH]    = {0};
 static char g_archivePath[MAX_PATH]   = {0};
 static char g_workerExePath[MAX_PATH] = {0};
@@ -216,29 +211,28 @@ DWORD WINAPI startup_init_thread(LPVOID lpParam) {
     return 0;
 }
 
-/* WASAPI callback: writes 16kHz Mono PCM frames to both 5s and 10s encoders simultaneously */
-void dual_data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
-    DualCaptureContext* ctx = (DualCaptureContext*)pDevice->pUserData;
-    if (ctx != NULL && pInput != NULL) {
+/* WASAPI callback: streams live 16kHz 16-bit Mono PCM frames directly into shared stream.pcm */
+void stream_pcm_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    StreamCaptureContext* ctx = (StreamCaptureContext*)pDevice->pUserData;
+    if (ctx != NULL && pInput != NULL && frameCount > 0) {
         EnterCriticalSection(&ctx->cs);
-        if (ctx->shortOpen) {
-            ma_encoder_write_pcm_frames(&ctx->encShort, pInput, frameCount, NULL);
-        }
-        if (ctx->deepOpen) {
-            ma_encoder_write_pcm_frames(&ctx->encDeep, pInput, frameCount, NULL);
+        if (ctx->isOpen && ctx->hFile != INVALID_HANDLE_VALUE) {
+            DWORD bytesToWrite = frameCount * sizeof(short);
+            DWORD bytesWritten = 0;
+            WriteFile(ctx->hFile, pInput, bytesToWrite, &bytesWritten, NULL);
         }
         LeaveCriticalSection(&ctx->cs);
     }
     (void)pOutput;
 }
 
-/* Spawns Python worker and passes both the 5s WAV path and the 10s deep WAV target path */
-HANDLE launch_python_worker(const char* shortWav, const char* deepReadyWav) {
-    char cmdLine[MAX_PATH * 3 + 32];
+/* Spawns Python worker at t=0.0s pointing to the live-growing stream.pcm file */
+HANDLE launch_python_worker(const char* pcmStreamPath) {
+    char cmdLine[MAX_PATH * 2 + 32];
     if (g_useNativePython) {
-        snprintf(cmdLine, sizeof(cmdLine), "python \"%s\" \"%s\" \"%s\"", g_scriptPath, shortWav, deepReadyWav);
+        snprintf(cmdLine, sizeof(cmdLine), "python \"%s\" \"%s\"", g_scriptPath, pcmStreamPath);
     } else {
-        snprintf(cmdLine, sizeof(cmdLine), "\"%s\" \"%s\" \"%s\"", g_workerExePath, shortWav, deepReadyWav);
+        snprintf(cmdLine, sizeof(cmdLine), "\"%s\" \"%s\"", g_workerExePath, pcmStreamPath);
     }
 
     STARTUPINFOA si = { sizeof(si) };
@@ -253,7 +247,7 @@ HANDLE launch_python_worker(const char* shortWav, const char* deepReadyWav) {
 
 /* Launches the Found Songs History window (--history) */
 void launch_history_viewer(void) {
-    if (g_loaderPhase == 3) return; /* Wait if first-run extraction is still active */
+    if (g_loaderPhase == 3) return;
 
     char cmdLine[MAX_PATH * 2 + 32];
     if (g_useNativePython) {
@@ -271,113 +265,91 @@ void launch_history_viewer(void) {
     }
 }
 
-/* Pipelined capture thread: records 0-5s and 0-10s simultaneously while Python searches at t=5s */
+/* Progressive streaming capture thread: records up to 12s while Python polls at 2.5s, 5s, 8.5s, 12s */
 DWORD WINAPI capture_thread(LPVOID lpParam) {
     (void)lpParam;
     g_cancelRequested = false;
 
-    DeleteFileA(g_wavPath);
-    DeleteFileA(g_deepWritePath);
-    DeleteFileA(g_deepReadyPath);
+    DeleteFileA(g_pcmPath);
 
-    DualCaptureContext ctx;
+    StreamCaptureContext ctx;
     ZeroMemory(&ctx, sizeof(ctx));
     InitializeCriticalSection(&ctx.cs);
 
-    ma_encoder_config encCfg = ma_encoder_config_init(ma_encoding_format_wav, ma_format_s16, 1, 16000);
-    if (ma_encoder_init_file(g_wavPath, &encCfg, &ctx.encShort) != MA_SUCCESS) {
+    /* Open stream.pcm with FILE_SHARE_READ so Python can read progressive slices while C writes */
+    ctx.hFile = CreateFileA(
+        g_pcmPath,
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY,
+        NULL
+    );
+
+    if (ctx.hFile == INVALID_HANDLE_VALUE) {
         DeleteCriticalSection(&ctx.cs);
         g_isBusy = false;
         return 0;
     }
-    ctx.shortOpen = true;
-
-    if (ma_encoder_init_file(g_deepWritePath, &encCfg, &ctx.encDeep) == MA_SUCCESS) {
-        ctx.deepOpen = true;
-    }
+    ctx.isOpen = true;
 
     ma_device_config devCfg = ma_device_config_init(ma_device_type_loopback);
     devCfg.capture.pDeviceID = NULL;
     devCfg.capture.format    = ma_format_s16;
     devCfg.capture.channels  = 1;
     devCfg.sampleRate        = 16000;
-    devCfg.dataCallback      = dual_data_callback;
+    devCfg.dataCallback      = stream_pcm_callback;
     devCfg.pUserData         = &ctx;
 
     ma_device device;
     if (ma_device_init(NULL, &devCfg, &device) != MA_SUCCESS || ma_device_start(&device) != MA_SUCCESS) {
-        if (ctx.shortOpen) ma_encoder_uninit(&ctx.encShort);
-        if (ctx.deepOpen)  ma_encoder_uninit(&ctx.encDeep);
+        CloseHandle(ctx.hFile);
         DeleteCriticalSection(&ctx.cs);
+        DeleteFileA(g_pcmPath);
         g_isBusy = false;
         return 0;
     }
 
-    /* Phase 1 (0s -> 5s): Show "Listening..." while recording both encoders */
+    /* Show "Listening..." and immediately spawn Python at t=0.0s so it warms up during the first 2.5s */
     PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 1, 0);
+    HANDLE hProc = launch_python_worker(g_pcmPath);
 
+    /* Safety Fallback if native Python was uninstalled after caching */
+    if (hProc == NULL && g_useNativePython) {
+        PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 3, 0);
+        if (extract_onedir_worker()) {
+            g_useNativePython = false;
+            save_mode_cache(2, get_resource_size(IDR_PYTHON_SCRIPT), get_resource_size(IDR_WORKER_ARCHIVE));
+            PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 1, 0);
+            hProc = launch_python_worker(g_pcmPath);
+        }
+    }
+
+    /* Stream audio up to 12s; exits early the instant Python matches a song (g_loaderPhase == 0) */
     int elapsedMs = 0;
-    const int shortTargetMs = RECORD_SHORT_SEC * 1000;
-    while (elapsedMs < shortTargetMs && !g_cancelRequested) {
+    const int maxRecordMs = RECORD_MAX_SEC * 1000;
+    while (elapsedMs < maxRecordMs && !g_cancelRequested && g_loaderPhase != 0) {
+        if (hProc != NULL && WaitForSingleObject(hProc, 50) == WAIT_OBJECT_0) {
+            break;
+        }
         Sleep(50);
         elapsedMs += 50;
     }
 
-    /* Finalize 5-second clip so Python can read it immediately */
-    EnterCriticalSection(&ctx.cs);
-    if (ctx.shortOpen) {
-        ctx.shortOpen = false;
-        ma_encoder_uninit(&ctx.encShort);
-    }
-    LeaveCriticalSection(&ctx.cs);
-
-    HANDLE hProc = NULL;
-
-    if (!g_cancelRequested) {
-        /* Phase 2 (5s -> 10s): Launch Python on 5s clip while continuing 10s recording in background */
-        PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 2, 0);
-        hProc = launch_python_worker(g_wavPath, g_deepReadyPath);
-
-        /* Safety Fallback if native Python was uninstalled */
-        if (hProc == NULL && g_useNativePython) {
-            PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 3, 0);
-            if (extract_onedir_worker()) {
-                g_useNativePython = false;
-                save_mode_cache(2, get_resource_size(IDR_PYTHON_SCRIPT), get_resource_size(IDR_WORKER_ARCHIVE));
-                PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 2, 0);
-                hProc = launch_python_worker(g_wavPath, g_deepReadyPath);
-            }
-        }
-
-        const int deepTargetMs = RECORD_DEEP_SEC * 1000;
-        while (elapsedMs < deepTargetMs && !g_cancelRequested && g_loaderPhase != 0) {
-            if (hProc != NULL && WaitForSingleObject(hProc, 50) == WAIT_OBJECT_0) {
-                break;
-            }
-            Sleep(50);
-            elapsedMs += 50;
-        }
-    }
-
-    /* Stop WASAPI capture and finalize the 10-second deep WAV file */
+    /* Stop WASAPI loopback capture and close write handle */
     ma_device_uninit(&device);
 
     EnterCriticalSection(&ctx.cs);
-    if (ctx.deepOpen) {
-        ctx.deepOpen = false;
-        ma_encoder_uninit(&ctx.encDeep);
+    if (ctx.isOpen) {
+        ctx.isOpen = false;
+        CloseHandle(ctx.hFile);
+        ctx.hFile = INVALID_HANDLE_VALUE;
     }
     LeaveCriticalSection(&ctx.cs);
     DeleteCriticalSection(&ctx.cs);
 
-    if (!g_cancelRequested && g_loaderPhase != 0 && file_exists(g_deepWritePath)) {
-        /* Atomic rename signals to Python that the 10s file is complete and ready */
-        MoveFileExA(g_deepWritePath, g_deepReadyPath, MOVEFILE_REPLACE_EXISTING);
-    } else {
-        DeleteFileA(g_deepWritePath);
-    }
-
-    /* Wait for Python worker to finish or terminate it if Cancel was clicked */
+    /* If Python is still finishing the 12s check / fallbacks, wait for it (or terminate on Cancel) */
     if (hProc != NULL) {
         while (!g_cancelRequested && g_loaderPhase != 0) {
             if (WaitForSingleObject(hProc, 50) == WAIT_OBJECT_0) {
@@ -391,12 +363,7 @@ DWORD WINAPI capture_thread(LPVOID lpParam) {
         CloseHandle(hProc);
     }
 
-    if (g_cancelRequested) {
-        DeleteFileA(g_wavPath);
-        DeleteFileA(g_deepWritePath);
-        DeleteFileA(g_deepReadyPath);
-    }
-
+    DeleteFileA(g_pcmPath);
     PostMessageA(g_hMainWnd, WM_APP_LOADER_STATE, 0, 0);
     g_isBusy = false;
     return 0;
@@ -636,9 +603,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     snprintf(g_workDir, sizeof(g_workDir), "%sSongFinder", tempBase);
     CreateDirectoryA(g_workDir, NULL);
 
-    snprintf(g_wavPath, sizeof(g_wavPath), "%s\\temp.wav", g_workDir);
-    snprintf(g_deepWritePath, sizeof(g_deepWritePath), "%s\\deep_writing.wav", g_workDir);
-    snprintf(g_deepReadyPath, sizeof(g_deepReadyPath), "%s\\deep_temp.wav", g_workDir);
+    snprintf(g_pcmPath, sizeof(g_pcmPath), "%s\\stream.pcm", g_workDir);
     snprintf(g_scriptPath, sizeof(g_scriptPath), "%s\\recognize_ui.py", g_workDir);
     snprintf(g_archivePath, sizeof(g_archivePath), "%s\\worker_pkg.zip", g_workDir);
     snprintf(g_workerExePath, sizeof(g_workerExePath), "%s\\recognize_ui\\recognize_ui.exe", g_workDir);
