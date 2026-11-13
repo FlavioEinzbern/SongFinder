@@ -15,6 +15,7 @@
 
 #define ID_TRAY_IDENTIFY    1001
 #define ID_TRAY_EXIT        1002
+#define ID_TRAY_HISTORY     1003
 
 #define IDR_PYTHON_SCRIPT   101
 #define IDR_WORKER_ARCHIVE  102
@@ -248,6 +249,26 @@ HANDLE launch_python_worker(const char* shortWav, const char* deepReadyWav) {
         return pi.hProcess;
     }
     return NULL;
+}
+
+/* Launches the Found Songs History window (--history) */
+void launch_history_viewer(void) {
+    if (g_loaderPhase == 3) return; /* Wait if first-run extraction is still active */
+
+    char cmdLine[MAX_PATH * 2 + 32];
+    if (g_useNativePython) {
+        snprintf(cmdLine, sizeof(cmdLine), "python \"%s\" --history", g_scriptPath);
+    } else {
+        snprintf(cmdLine, sizeof(cmdLine), "\"%s\" --history", g_workerExePath);
+    }
+
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {0};
+
+    if (CreateProcessA(NULL, cmdLine, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
 }
 
 /* Pipelined capture thread: records 0-5s and 0-10s simultaneously while Python searches at t=5s */
@@ -573,8 +594,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 GetCursorPos(&pt);
                 HMENU hMenu = CreatePopupMenu();
                 AppendMenuA(hMenu, MF_STRING, ID_TRAY_IDENTIFY, "Identify Song Now (Ctrl+Alt+S)");
+                AppendMenuA(hMenu, MF_STRING, ID_TRAY_HISTORY,  "Found Songs History");
                 AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
-                AppendMenuA(hMenu, MF_STRING, ID_TRAY_EXIT, "Exit");
+                AppendMenuA(hMenu, MF_STRING, ID_TRAY_EXIT,     "Exit");
 
                 SetForegroundWindow(hwnd);
                 TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
@@ -585,6 +607,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_TRAY_IDENTIFY) {
                 trigger_identification();
+            } else if (LOWORD(wParam) == ID_TRAY_HISTORY) {
+                launch_history_viewer();
             } else if (LOWORD(wParam) == ID_TRAY_EXIT) {
                 PostQuitMessage(0);
             }
