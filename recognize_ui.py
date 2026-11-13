@@ -66,19 +66,41 @@ def fetch_json(url: str, timeout: float = 3.5) -> dict:
 
 
 def normalize_for_match(text: str) -> str:
-    """Normalizes track/artist strings for strict catalog matching."""
-    cleaned = re.sub(r"\(.*?\)|\[.*?\]", "", text.lower())
+    """Normalizes track/artist/album strings (preserving Unicode) for catalog verification."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"\(.*?\)|\[.*?\]", " ", text.lower())
     cleaned = re.sub(r"[^\w\s]", " ", cleaned)
     return " ".join(cleaned.split())
 
 
 def names_match(expected: str, candidate: str) -> bool:
-    """Checks if a catalog result's title or artist matches the identified track."""
+    """Checks if a catalog result's title, artist, or album matches the expected value."""
     a = normalize_for_match(expected)
     b = normalize_for_match(candidate)
     if not a or not b:
         return False
-    return (a in b) or (b in a)
+    if a in b or b in a:
+        return True
+    # Also check primary artist token before feat./comma separators
+    primary_a = normalize_for_match(re.split(r"[,&/]|feat\.?|ft\.?|cv\.?", expected, flags=re.IGNORECASE)[0])
+    if primary_a and len(primary_a) >= 3 and (primary_a in b or b in primary_a):
+        return True
+    return False
+
+
+def extract_youtube_video_id(url: str) -> str:
+    """Extracts the 11-character YouTube videoId from a youtu.be or youtube.com URL."""
+    if not url:
+        return ""
+    patterns = [
+        r"(?:v=|youtu\.be/|/embed/|/v/)([A-Za-z0-9_-]{11})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return ""
 
 
 def shift_wav_speed(wav_bytes: bytes, factor: float) -> bytes:
@@ -120,72 +142,106 @@ def extract_album_from_shazam(track_data: dict) -> str:
 
 
 def extract_streaming_from_shazam(track_data: dict) -> dict:
-    """Extracts Apple Music and Spotify links directly from Shazam's hub payload."""
-    links = {"apple_url": "", "spotify_url": ""}
+    """
+    Extracts direct Apple Music, Spotify, and YouTube links from Shazam's payload
+    (Fix 1: checks hub actions/providers as well as the VIDEO section).
+    """
+    links = {"apple_url": "", "spotify_url": "", "yt_url": ""}
     hub = track_data.get("hub", {})
-    if not isinstance(hub, dict):
-        return links
+    if isinstance(hub, dict):
+        # 1. Check hub actions and options for Apple Music URLs
+        action_lists = [hub.get("actions", [])]
+        for opt in hub.get("options", []):
+            if isinstance(opt, dict):
+                action_lists.append(opt.get("actions", []))
 
-    # 1. Check hub actions and options for Apple Music URLs
-    action_lists = [hub.get("actions", [])]
-    for opt in hub.get("options", []):
-        if isinstance(opt, dict):
-            action_lists.append(opt.get("actions", []))
-
-    for actions in action_lists:
-        if not isinstance(actions, list):
-            continue
-        for act in actions:
-            if not isinstance(act, dict):
+        for actions in action_lists:
+            if not isinstance(actions, list):
                 continue
-            uri = act.get("uri", "")
-            if uri.startswith("https://music.apple.com") or uri.startswith("https://itunes.apple.com"):
-                links["apple_url"] = uri
+            for act in actions:
+                if not isinstance(act, dict):
+                    continue
+                uri = act.get("uri", "")
+                if uri.startswith("https://music.apple.com") or uri.startswith("https://itunes.apple.com"):
+                    links["apple_url"] = uri
+                    break
+            if links["apple_url"]:
                 break
-        if links["apple_url"]:
-            break
 
-    # 2. Check hub providers for Spotify links
-    for prov in hub.get("providers", []):
-        if not isinstance(prov, dict):
-            continue
-        p_type = prov.get("type", "").upper()
-        p_cap = prov.get("caption", "").lower()
-        if p_type == "SPOTIFY" or "spotify" in p_cap:
+        # 2. Check hub providers for Spotify or YouTube links
+        for prov in hub.get("providers", []):
+            if not isinstance(prov, dict):
+                continue
+            p_type = prov.get("type", "").upper()
+            p_cap = prov.get("caption", "").lower()
             for act in prov.get("actions", []):
                 if not isinstance(act, dict):
                     continue
                 uri = act.get("uri", "")
-                if uri.startswith("https://open.spotify.com/"):
-                    links["spotify_url"] = uri
-                    break
-                elif uri.startswith("spotify:track:"):
-                    track_id = uri.split("spotify:track:")[-1].split("?")[0].strip()
-                    if track_id:
-                        links["spotify_url"] = f"https://open.spotify.com/track/{track_id}"
+                if p_type == "SPOTIFY" or "spotify" in p_cap:
+                    if uri.startswith("https://open.spotify.com/"):
+                        links["spotify_url"] = uri
                         break
-                elif uri.startswith("spotify:search:") and not links["spotify_url"]:
-                    raw_q = uri.split("spotify:search:")[-1].strip()
-                    if raw_q:
-                        links["spotify_url"] = f"https://open.spotify.com/search/{raw_q}"
+                    elif uri.startswith("spotify:track:"):
+                        track_id = uri.split("spotify:track:")[-1].split("?")[0].strip()
+                        if track_id:
+                            links["spotify_url"] = f"https://open.spotify.com/track/{track_id}"
+                            break
+                    elif uri.startswith("spotify:search:") and not links["spotify_url"]:
+                        raw_q = uri.split("spotify:search:")[-1].strip()
+                        if raw_q:
+                            links["spotify_url"] = f"https://open.spotify.com/search/{raw_q}"
+                if "youtu.be/" in uri or "youtube.com/watch" in uri:
+                    links["yt_url"] = uri
+
+    # 3. Check Shazam's VIDEO section for direct YouTube URLs or Shazam video endpoints
+    for section in track_data.get("sections", []):
+        if not isinstance(section, dict):
+            continue
+        yt_field = section.get("youtubeurl")
+        if isinstance(yt_field, str):
+            if "youtu.be/" in yt_field or "youtube.com/watch" in yt_field:
+                links["yt_url"] = yt_field
+                break
+            elif yt_field.startswith("https://"):
+                vid_json = fetch_json(yt_field, timeout=2.0)
+                for act in vid_json.get("actions", []):
+                    uri = act.get("uri", "") if isinstance(act, dict) else ""
+                    if "youtu.be/" in uri or "youtube.com/watch" in uri:
+                        links["yt_url"] = uri
+                        break
+        elif isinstance(yt_field, dict):
+            for act in yt_field.get("actions", []):
+                uri = act.get("uri", "") if isinstance(act, dict) else ""
+                if "youtu.be/" in uri or "youtube.com/watch" in uri:
+                    links["yt_url"] = uri
+                    break
+        if links["yt_url"]:
+            break
 
     return links
 
 
-def resolve_spotify_and_apple_links(
-    artist: str, title: str, shazam_apple: str = "", shazam_spotify: str = ""
+def resolve_streaming_and_songlink(
+    artist: str,
+    title: str,
+    shazam_apple: str = "",
+    shazam_spotify: str = "",
+    shazam_yt: str = ""
 ) -> dict:
     """
-    Verifies if the song exists on Apple Music and Spotify using Shazam hub data,
-    Apple's iTunes Search API, Songlink, and Deezer's commercial streaming catalog.
-    Returns empty strings for platforms where the song is not available.
+    Verifies Apple Music & Spotify presence and uses Songlink's ISRC lookup (Fix 1)
+    to fetch exact YouTube and YouTube Music links whenever available.
     """
     apple_url = shazam_apple
     spotify_url = shazam_spotify
+    yt_url = shazam_yt
+    ytm_url = ""
+
     query = f"{artist} {title}".strip()
     encoded_q = urllib.parse.quote_plus(query)
 
-    # 1. Verify / Resolve Apple Music via Apple's official keyless iTunes Search API
+    # 1. Verify / Resolve Apple Music via Apple's keyless iTunes Search API
     if not apple_url:
         itunes_data = fetch_json(
             f"https://itunes.apple.com/search?term={encoded_q}&entity=song&limit=5",
@@ -197,13 +253,23 @@ def resolve_spotify_and_apple_links(
                 if apple_url:
                     break
 
-    # 2. If we have an Apple Music URL but no direct Spotify track URL, try cross-platform lookup
-    if apple_url and (not spotify_url or "/search/" in spotify_url):
+    # 2. Query Songlink using Apple Music URL to get exact ISRC-matched Spotify & YouTube links
+    if apple_url and (not spotify_url or "/search/" in spotify_url or not yt_url):
         sl_url = f"https://api.song.link/v1-alpha.1/links?url={urllib.parse.quote_plus(apple_url)}"
-        sl_data = fetch_json(sl_url, timeout=2.0)
-        sp_link = sl_data.get("linksByPlatform", {}).get("spotify", {}).get("url", "")
-        if sp_link:
-            spotify_url = sp_link
+        sl_data = fetch_json(sl_url, timeout=2.5)
+        platforms = sl_data.get("linksByPlatform", {})
+        if isinstance(platforms, dict):
+            sp_link = platforms.get("spotify", {}).get("url", "")
+            if sp_link and (not spotify_url or "/search/" in spotify_url):
+                spotify_url = sp_link
+
+            sl_yt = platforms.get("youtube", {}).get("url", "")
+            if sl_yt and not yt_url:
+                yt_url = sl_yt
+
+            sl_ytm = platforms.get("youtubeMusic", {}).get("url", "")
+            if sl_ytm:
+                ytm_url = sl_ytm
 
     # 3. If Spotify is still unresolved, verify commercial streaming presence via Deezer API
     if not spotify_url:
@@ -217,8 +283,131 @@ def resolve_spotify_and_apple_links(
 
     return {
         "apple_url": apple_url,
-        "spotify_url": spotify_url
+        "spotify_url": spotify_url,
+        "yt_url": yt_url,
+        "ytm_url": ytm_url
     }
+
+
+def is_verified_youtube_hit(
+    hit: dict,
+    target_title: str,
+    target_artist: str,
+    target_album: str,
+    is_video: bool
+) -> bool:
+    """
+    Fix 2 Helper: Ensures a YouTube Music song or video result actually matches
+    the identified track's Title and Artist/Album instead of a random popular song.
+    """
+    hit_title = hit.get("title", "")
+    if not hit_title:
+        return False
+
+    hit_artists = " ".join(
+        a.get("name", "") for a in hit.get("artists", []) if isinstance(a, dict)
+    )
+    album_obj = hit.get("album")
+    hit_album = album_obj.get("name", "") if isinstance(album_obj, dict) else ""
+
+    title_ok = names_match(target_title, hit_title)
+    if not title_ok:
+        return False
+
+    known_artist = target_artist and target_artist not in ("Unknown Artist", "Anime Theme Artist")
+    known_album = target_album and target_album != "Single / Unknown Album"
+
+    if not is_video:
+        # Official "songs" filter: require artist match or album match
+        if known_artist and names_match(target_artist, hit_artists):
+            return True
+        if known_album and (names_match(target_album, hit_album) or names_match(target_album, hit_title)):
+            return True
+        return not known_artist and not known_album
+    else:
+        # Standard YouTube "videos" filter: artist or album often appears in the video title or channel name
+        combined_meta = f"{hit_title} {hit_artists}"
+        if known_artist and names_match(target_artist, combined_meta):
+            return True
+        if known_album and names_match(target_album, combined_meta):
+            return True
+        return not known_artist and not known_album
+
+
+def resolve_youtube_links(
+    artist: str,
+    title: str,
+    album: str = "",
+    direct_yt_url: str = "",
+    direct_ytm_url: str = ""
+) -> dict:
+    """
+    Resolves YouTube and YT Music links using:
+      - Fix 1: Direct videoId from Shazam or Songlink if available
+      - Fix 2: Verified limit=5 search across 'songs' then 'videos'
+      - Fix 3: Album/Anime/Game context search if artist+title is ambiguous
+      - Fix 4: Safe search-results URL fallback if no verified videoId is found
+    """
+    base_query = f"{artist} - {title}".strip(" -")
+    encoded_q = urllib.parse.quote_plus(base_query)
+
+    # Fix 4: Safe default search URLs (used if no specific video passes verification)
+    result = {
+        "yt_url": f"https://www.youtube.com/results?search_query={encoded_q}",
+        "ytm_url": f"https://music.youtube.com/search?q={encoded_q}",
+        "album": "",
+        "cover_url": ""
+    }
+
+    # Fix 1: Use direct videoId from Shazam or Songlink if already discovered
+    direct_vid = extract_youtube_video_id(direct_yt_url) or extract_youtube_video_id(direct_ytm_url)
+    if direct_vid:
+        result["yt_url"] = f"https://www.youtube.com/watch?v={direct_vid}"
+        result["ytm_url"] = f"https://music.youtube.com/watch?v={direct_vid}"
+
+    try:
+        ytm = YTMusic()
+        verified_hit = None
+
+        # Pass 1: Check top 5 licensed "songs"
+        song_hits = ytm.search(base_query, filter="songs", limit=5) or []
+        for hit in song_hits:
+            if is_verified_youtube_hit(hit, title, artist, album, is_video=False):
+                verified_hit = hit
+                break
+
+        # Pass 2: Check top 5 standard YouTube "videos" (catches OSTs, remixes, covers, uploads)
+        if not verified_hit:
+            video_hits = ytm.search(base_query, filter="videos", limit=5) or []
+            for hit in video_hits:
+                if is_verified_youtube_hit(hit, title, artist, album, is_video=True):
+                    verified_hit = hit
+                    break
+
+        # Pass 3 (Fix 3): Disambiguate using enriched Anime / Game OST Album name
+        if not verified_hit and album and album != "Single / Unknown Album":
+            album_query = f"{title} {album}".strip()
+            album_hits = ytm.search(album_query, filter="videos", limit=5) or []
+            for hit in album_hits:
+                if is_verified_youtube_hit(hit, title, artist, album, is_video=True):
+                    verified_hit = hit
+                    break
+
+        if verified_hit:
+            video_id = verified_hit.get("videoId")
+            if video_id and not direct_vid:
+                result["yt_url"] = f"https://www.youtube.com/watch?v={video_id}"
+                result["ytm_url"] = f"https://music.youtube.com/watch?v={video_id}"
+            album_info = verified_hit.get("album")
+            if isinstance(album_info, dict) and album_info.get("name"):
+                result["album"] = album_info["name"]
+            thumbs = verified_hit.get("thumbnails", [])
+            if thumbs and isinstance(thumbs[-1], dict):
+                result["cover_url"] = thumbs[-1].get("url", "")
+    except Exception:
+        pass
+
+    return result
 
 
 def query_animethemes_api(query: str) -> dict:
@@ -344,41 +533,6 @@ def enrich_with_anime_vg_databases(title: str, artist: str, album: str, cover_ur
             cover_url = jikan_hit["cover_url"]
 
     return album, cover_url
-
-
-def resolve_youtube_links(artist: str, title: str) -> dict:
-    """Finds the exact YouTube / YT Music videoId, fallback album name, and thumbnail."""
-    query = f"{artist} - {title}".strip(" -")
-    encoded_q = urllib.parse.quote_plus(query)
-    result = {
-        "yt_url": f"https://www.youtube.com/results?search_query={encoded_q}",
-        "ytm_url": f"https://music.youtube.com/search?q={encoded_q}",
-        "album": "",
-        "cover_url": ""
-    }
-
-    try:
-        ytm = YTMusic()
-        search_hits = ytm.search(query, filter="songs", limit=1)
-        if not search_hits:
-            search_hits = ytm.search(query, filter="videos", limit=1)
-
-        if search_hits:
-            top = search_hits[0]
-            video_id = top.get("videoId")
-            if video_id:
-                result["yt_url"] = f"https://www.youtube.com/watch?v={video_id}"
-                result["ytm_url"] = f"https://music.youtube.com/watch?v={video_id}"
-            album_info = top.get("album")
-            if isinstance(album_info, dict) and album_info.get("name"):
-                result["album"] = album_info["name"]
-            thumbs = top.get("thumbnails", [])
-            if thumbs and isinstance(thumbs[-1], dict):
-                result["cover_url"] = thumbs[-1].get("url", "")
-    except Exception:
-        pass
-
-    return result
 
 
 async def shazam_recognize_bytes(shazam: Shazam, wav_bytes: bytes) -> dict:
@@ -514,17 +668,36 @@ def build_final_result(
     album: str,
     cover_url: str,
     shazam_apple: str = "",
-    shazam_spotify: str = ""
+    shazam_spotify: str = "",
+    shazam_yt: str = ""
 ) -> dict:
-    """Combines YouTube, Spotify, and Apple Music resolution with Anime/VG enrichment."""
-    yt_data = resolve_youtube_links(artist, title)
-    if not album and yt_data["album"]:
+    """
+    Fix 3 Order:
+      1. Enriches Album/Anime/Game metadata first so we have context for disambiguation.
+      2. Resolves Apple Music, Spotify, and Songlink ISRC YouTube links.
+      3. Resolves & verifies YouTube / YT Music links using direct IDs or verified 5-hit search.
+    """
+    # 1. Enrich with AnimeThemes, VGMdb, and Jikan first
+    album, cover_url = enrich_with_anime_vg_databases(title, artist, album, cover_url)
+
+    # 2. Check Apple Music, Spotify, and Songlink cross-platform IDs
+    stream_links = resolve_streaming_and_songlink(
+        artist, title, shazam_apple, shazam_spotify, shazam_yt
+    )
+
+    # 3. Resolve verified YouTube / YT Music links with enriched album context
+    yt_data = resolve_youtube_links(
+        artist,
+        title,
+        album=album,
+        direct_yt_url=stream_links["yt_url"],
+        direct_ytm_url=stream_links["ytm_url"]
+    )
+
+    if (not album or album == "Single / Unknown Album") and yt_data["album"]:
         album = yt_data["album"]
     if not cover_url and yt_data["cover_url"]:
         cover_url = yt_data["cover_url"]
-
-    stream_links = resolve_spotify_and_apple_links(artist, title, shazam_apple, shazam_spotify)
-    album, cover_url = enrich_with_anime_vg_databases(title, artist, album, cover_url)
 
     return {
         "found": True,
@@ -560,7 +733,7 @@ async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
       2. Backup 2: Speed/Pitch-Shift Retry (0.88x & 1.14x) on the 5s clip
       3. Backup 1: Wait remaining ~2-3s for C's 10s cumulative clip + Shazam/Speed-Shift
       4. Backup 4: 5-Language (en-US, ja-JP, pt-BR, es-ES, ko-KR) Vocal Transcription
-      5. Stage 5: Spotify/Apple Music verification + AnimeThemes/VGMdb/Jikan enrichment
+      5. Stage 5: Anime/VG Enrichment -> Songlink/Spotify/Apple -> Verified YouTube Resolution
     """
     shazam = Shazam()
     with open(wav_path, "rb") as f:
@@ -578,7 +751,7 @@ async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
         return await asyncio.to_thread(
             build_final_result,
             title, artist, album, cover_url,
-            hub_links["apple_url"], hub_links["spotify_url"]
+            hub_links["apple_url"], hub_links["spotify_url"], hub_links["yt_url"]
         )
 
     # Stage 3 (Backup 1): Wait for C's simultaneous 0-10s recording to complete
@@ -603,7 +776,7 @@ async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
                     return await asyncio.to_thread(
                         build_final_result,
                         title, artist, album, cover_url,
-                        hub_links["apple_url"], hub_links["spotify_url"]
+                        hub_links["apple_url"], hub_links["spotify_url"], hub_links["yt_url"]
                     )
             except Exception:
                 pass
