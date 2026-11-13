@@ -1,6 +1,7 @@
 import sys
 import os
 import io
+import re
 import wave
 import array
 import json
@@ -55,13 +56,29 @@ def notify_host_retry():
 
 
 def fetch_json(url: str, timeout: float = 3.5) -> dict:
-    """Helper for querying AnimeThemes, VGMdb, and Jikan JSON REST APIs."""
+    """Helper for querying JSON REST APIs."""
     try:
         req = urllib.request.Request(url, headers=HTTP_HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", errors="ignore"))
     except Exception:
         return {}
+
+
+def normalize_for_match(text: str) -> str:
+    """Normalizes track/artist strings for strict catalog matching."""
+    cleaned = re.sub(r"\(.*?\)|\[.*?\]", "", text.lower())
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+    return " ".join(cleaned.split())
+
+
+def names_match(expected: str, candidate: str) -> bool:
+    """Checks if a catalog result's title or artist matches the identified track."""
+    a = normalize_for_match(expected)
+    b = normalize_for_match(candidate)
+    if not a or not b:
+        return False
+    return (a in b) or (b in a)
 
 
 def shift_wav_speed(wav_bytes: bytes, factor: float) -> bytes:
@@ -100,6 +117,108 @@ def extract_album_from_shazam(track_data: dict) -> str:
                 if meta.get("title", "").lower() == "album":
                     return meta.get("text", "")
     return ""
+
+
+def extract_streaming_from_shazam(track_data: dict) -> dict:
+    """Extracts Apple Music and Spotify links directly from Shazam's hub payload."""
+    links = {"apple_url": "", "spotify_url": ""}
+    hub = track_data.get("hub", {})
+    if not isinstance(hub, dict):
+        return links
+
+    # 1. Check hub actions and options for Apple Music URLs
+    action_lists = [hub.get("actions", [])]
+    for opt in hub.get("options", []):
+        if isinstance(opt, dict):
+            action_lists.append(opt.get("actions", []))
+
+    for actions in action_lists:
+        if not isinstance(actions, list):
+            continue
+        for act in actions:
+            if not isinstance(act, dict):
+                continue
+            uri = act.get("uri", "")
+            if uri.startswith("https://music.apple.com") or uri.startswith("https://itunes.apple.com"):
+                links["apple_url"] = uri
+                break
+        if links["apple_url"]:
+            break
+
+    # 2. Check hub providers for Spotify links
+    for prov in hub.get("providers", []):
+        if not isinstance(prov, dict):
+            continue
+        p_type = prov.get("type", "").upper()
+        p_cap = prov.get("caption", "").lower()
+        if p_type == "SPOTIFY" or "spotify" in p_cap:
+            for act in prov.get("actions", []):
+                if not isinstance(act, dict):
+                    continue
+                uri = act.get("uri", "")
+                if uri.startswith("https://open.spotify.com/"):
+                    links["spotify_url"] = uri
+                    break
+                elif uri.startswith("spotify:track:"):
+                    track_id = uri.split("spotify:track:")[-1].split("?")[0].strip()
+                    if track_id:
+                        links["spotify_url"] = f"https://open.spotify.com/track/{track_id}"
+                        break
+                elif uri.startswith("spotify:search:") and not links["spotify_url"]:
+                    raw_q = uri.split("spotify:search:")[-1].strip()
+                    if raw_q:
+                        links["spotify_url"] = f"https://open.spotify.com/search/{raw_q}"
+
+    return links
+
+
+def resolve_spotify_and_apple_links(
+    artist: str, title: str, shazam_apple: str = "", shazam_spotify: str = ""
+) -> dict:
+    """
+    Verifies if the song exists on Apple Music and Spotify using Shazam hub data,
+    Apple's iTunes Search API, Songlink, and Deezer's commercial streaming catalog.
+    Returns empty strings for platforms where the song is not available.
+    """
+    apple_url = shazam_apple
+    spotify_url = shazam_spotify
+    query = f"{artist} {title}".strip()
+    encoded_q = urllib.parse.quote_plus(query)
+
+    # 1. Verify / Resolve Apple Music via Apple's official keyless iTunes Search API
+    if not apple_url:
+        itunes_data = fetch_json(
+            f"https://itunes.apple.com/search?term={encoded_q}&entity=song&limit=5",
+            timeout=3.0
+        )
+        for item in itunes_data.get("results", []):
+            if names_match(title, item.get("trackName", "")) and names_match(artist, item.get("artistName", "")):
+                apple_url = item.get("trackViewUrl", "")
+                if apple_url:
+                    break
+
+    # 2. If we have an Apple Music URL but no direct Spotify track URL, try cross-platform lookup
+    if apple_url and (not spotify_url or "/search/" in spotify_url):
+        sl_url = f"https://api.song.link/v1-alpha.1/links?url={urllib.parse.quote_plus(apple_url)}"
+        sl_data = fetch_json(sl_url, timeout=2.0)
+        sp_link = sl_data.get("linksByPlatform", {}).get("spotify", {}).get("url", "")
+        if sp_link:
+            spotify_url = sp_link
+
+    # 3. If Spotify is still unresolved, verify commercial streaming presence via Deezer API
+    if not spotify_url:
+        dz_data = fetch_json(f"https://api.deezer.com/search?q={encoded_q}&limit=5", timeout=2.5)
+        for item in dz_data.get("data", []):
+            dz_title = item.get("title", "")
+            dz_artist = item.get("artist", {}).get("name", "") if isinstance(item.get("artist"), dict) else ""
+            if names_match(title, dz_title) and names_match(artist, dz_artist):
+                spotify_url = f"https://open.spotify.com/search/{urllib.parse.quote(query)}"
+                break
+
+    return {
+        "apple_url": apple_url,
+        "spotify_url": spotify_url
+    }
 
 
 def query_animethemes_api(query: str) -> dict:
@@ -345,7 +464,6 @@ async def backup4_vocal_search(wav_bytes: bytes) -> dict:
     if not candidates:
         return {}
 
-    # Sort highest confidence score first to avoid cross-language phonetic collisions
     candidates.sort(key=lambda item: item[0], reverse=True)
 
     ytm = None
@@ -355,7 +473,6 @@ async def backup4_vocal_search(wav_bytes: bytes) -> dict:
         pass
 
     for _, lang, phrase in candidates:
-        # 1. Check AnimeThemes API first for Japanese/English anime themes
         if lang in ("ja-JP", "en-US"):
             at_match = await asyncio.to_thread(query_animethemes_api, phrase)
             if at_match.get("title"):
@@ -366,7 +483,6 @@ async def backup4_vocal_search(wav_bytes: bytes) -> dict:
                     "cover_url": at_match.get("cover_url") or ""
                 }
 
-        # 2. Search YouTube Music songs by transcribed lyrics
         if ytm is not None:
             try:
                 hits = ytm.search(phrase, filter="songs", limit=1)
@@ -392,14 +508,22 @@ async def backup4_vocal_search(wav_bytes: bytes) -> dict:
     return {}
 
 
-def build_final_result(title: str, artist: str, album: str, cover_url: str) -> dict:
-    """Combines YouTube Music link resolution with AnimeThemes/VGMdb/Jikan enrichment."""
+def build_final_result(
+    title: str,
+    artist: str,
+    album: str,
+    cover_url: str,
+    shazam_apple: str = "",
+    shazam_spotify: str = ""
+) -> dict:
+    """Combines YouTube, Spotify, and Apple Music resolution with Anime/VG enrichment."""
     yt_data = resolve_youtube_links(artist, title)
     if not album and yt_data["album"]:
         album = yt_data["album"]
     if not cover_url and yt_data["cover_url"]:
         cover_url = yt_data["cover_url"]
 
+    stream_links = resolve_spotify_and_apple_links(artist, title, shazam_apple, shazam_spotify)
     album, cover_url = enrich_with_anime_vg_databases(title, artist, album, cover_url)
 
     return {
@@ -409,7 +533,9 @@ def build_final_result(title: str, artist: str, album: str, cover_url: str) -> d
         "album": album or "Single / Unknown Album",
         "cover_url": cover_url,
         "yt_url": yt_data["yt_url"],
-        "ytm_url": yt_data["ytm_url"]
+        "ytm_url": yt_data["ytm_url"],
+        "spotify_url": stream_links["spotify_url"],
+        "apple_url": stream_links["apple_url"]
     }
 
 
@@ -434,7 +560,7 @@ async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
       2. Backup 2: Speed/Pitch-Shift Retry (0.88x & 1.14x) on the 5s clip
       3. Backup 1: Wait remaining ~2-3s for C's 10s cumulative clip + Shazam/Speed-Shift
       4. Backup 4: 5-Language (en-US, ja-JP, pt-BR, es-ES, ko-KR) Vocal Transcription
-      5. Stage 5: AnimeThemes / VGMdb / Jikan metadata & cover art enrichment
+      5. Stage 5: Spotify/Apple Music verification + AnimeThemes/VGMdb/Jikan enrichment
     """
     shazam = Shazam()
     with open(wav_path, "rb") as f:
@@ -448,7 +574,12 @@ async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
         images = track.get("images", {})
         cover_url = images.get("coverarthq") or images.get("coverart") or ""
         album = extract_album_from_shazam(track)
-        return await asyncio.to_thread(build_final_result, title, artist, album, cover_url)
+        hub_links = extract_streaming_from_shazam(track)
+        return await asyncio.to_thread(
+            build_final_result,
+            title, artist, album, cover_url,
+            hub_links["apple_url"], hub_links["spotify_url"]
+        )
 
     # Stage 3 (Backup 1): Wait for C's simultaneous 0-10s recording to complete
     active_wav_bytes = wav_5s_bytes
@@ -468,7 +599,12 @@ async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
                     images = track.get("images", {})
                     cover_url = images.get("coverarthq") or images.get("coverart") or ""
                     album = extract_album_from_shazam(track)
-                    return await asyncio.to_thread(build_final_result, title, artist, album, cover_url)
+                    hub_links = extract_streaming_from_shazam(track)
+                    return await asyncio.to_thread(
+                        build_final_result,
+                        title, artist, album, cover_url,
+                        hub_links["apple_url"], hub_links["spotify_url"]
+                    )
             except Exception:
                 pass
 
@@ -487,21 +623,22 @@ async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
 
 
 def show_result_window(data: dict):
-    """Renders a desktop card with album art, YouTube links, and Try Again button."""
+    """Renders a desktop card with album art, streaming links, and Try Again button."""
     root = tk.Tk()
     root.title("Song Identified" if data.get("found") else "No Match Found")
     root.configure(bg="#18181b")
     root.resizable(False, False)
     root.attributes("-topmost", True)
 
-    win_w, win_h = 440, 210
+    win_w, win_h = 500, 230
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
     root.geometry(f"{win_w}x{win_h}+{screen_w - win_w - 24}+{screen_h - win_h - 64}")
 
     def open_link_and_close(url: str):
-        webbrowser.open(url)
-        root.destroy()
+        if url:
+            webbrowser.open(url)
+            root.destroy()
 
     def retry_and_close():
         root.destroy()
@@ -547,7 +684,7 @@ def show_result_window(data: dict):
             req = urllib.request.Request(data["cover_url"], headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=4) as resp:
                 img_bytes = resp.read()
-            pil_img = Image.open(BytesIO(img_bytes)).resize((140, 140), Image.Resampling.LANCZOS)
+            pil_img = Image.open(BytesIO(img_bytes)).resize((145, 145), Image.Resampling.LANCZOS)
             cover_photo = ImageTk.PhotoImage(pil_img)
         except Exception:
             cover_photo = None
@@ -557,47 +694,85 @@ def show_result_window(data: dict):
     if cover_photo:
         img_label = tk.Label(container, image=cover_photo, bg="#27272a", bd=0)
         img_label.image = cover_photo
-        img_label.pack(side="left", padx=(0, 14))
+        img_label.pack(side="left", padx=(0, 14), anchor="n")
 
     info_frame = tk.Frame(container, bg="#18181b")
     info_frame.pack(side="left", fill="both", expand=True)
 
     tk.Label(
         info_frame, text=data["title"], fg="#ffffff", bg="#18181b",
-        font=("Segoe UI", 12, "bold"), anchor="w", wraplength=250, justify="left"
+        font=("Segoe UI", 12, "bold"), anchor="w", wraplength=305, justify="left"
     ).pack(fill="x")
 
     tk.Label(
         info_frame, text=data["artist"], fg="#a1a1aa", bg="#18181b",
-        font=("Segoe UI", 10), anchor="w", wraplength=250, justify="left"
+        font=("Segoe UI", 10), anchor="w", wraplength=305, justify="left"
     ).pack(fill="x", pady=(2, 0))
 
     tk.Label(
         info_frame, text=f"Album: {data['album']}", fg="#71717a", bg="#18181b",
-        font=("Segoe UI", 9), anchor="w", wraplength=250, justify="left"
-    ).pack(fill="x", pady=(2, 12))
+        font=("Segoe UI", 9), anchor="w", wraplength=305, justify="left"
+    ).pack(fill="x", pady=(2, 8))
 
-    btn_frame = tk.Frame(info_frame, bg="#18181b")
-    btn_frame.pack(fill="x", side="bottom")
+    btn_area = tk.Frame(info_frame, bg="#18181b")
+    btn_area.pack(fill="x", side="bottom")
+
+    # Row 1: Streaming Platform Buttons (YouTube, YT Music, Spotify, Apple Music)
+    row_platforms = tk.Frame(btn_area, bg="#18181b")
+    row_platforms.pack(fill="x", pady=(0, 6))
 
     tk.Button(
-        btn_frame, text="YouTube", bg="#ef4444", fg="#ffffff",
+        row_platforms, text="YouTube", bg="#ef4444", fg="#ffffff",
         activebackground="#dc2626", activeforeground="#ffffff",
-        font=("Segoe UI", 9, "bold"), relief="flat", padx=9, pady=5, cursor="hand2",
+        font=("Segoe UI", 8, "bold"), relief="flat", padx=8, pady=4, cursor="hand2",
         command=lambda: open_link_and_close(data["yt_url"])
-    ).pack(side="left", padx=(0, 6))
+    ).pack(side="left", padx=(0, 5))
 
     tk.Button(
-        btn_frame, text="YT Music", bg="#27272a", fg="#ffffff",
+        row_platforms, text="YT Music", bg="#27272a", fg="#ffffff",
         activebackground="#3f3f46", activeforeground="#ffffff",
-        font=("Segoe UI", 9, "bold"), relief="flat", padx=9, pady=5, cursor="hand2",
+        font=("Segoe UI", 8, "bold"), relief="flat", padx=8, pady=4, cursor="hand2",
         command=lambda: open_link_and_close(data["ytm_url"])
-    ).pack(side="left", padx=(0, 6))
+    ).pack(side="left", padx=(0, 5))
+
+    spotify_url = data.get("spotify_url", "")
+    if spotify_url:
+        tk.Button(
+            row_platforms, text="Spotify", bg="#1db954", fg="#ffffff",
+            activebackground="#16a34a", activeforeground="#ffffff",
+            font=("Segoe UI", 8, "bold"), relief="flat", padx=8, pady=4, cursor="hand2",
+            command=lambda: open_link_and_close(spotify_url)
+        ).pack(side="left", padx=(0, 5))
+    else:
+        tk.Button(
+            row_platforms, text="Spotify", bg="#27272a", fg="#52525b",
+            disabledforeground="#52525b", font=("Segoe UI", 8, "bold"),
+            relief="flat", padx=8, pady=4, state="disabled", cursor="arrow"
+        ).pack(side="left", padx=(0, 5))
+
+    apple_url = data.get("apple_url", "")
+    if apple_url:
+        tk.Button(
+            row_platforms, text="Apple Music", bg="#fa243c", fg="#ffffff",
+            activebackground="#e11d48", activeforeground="#ffffff",
+            font=("Segoe UI", 8, "bold"), relief="flat", padx=8, pady=4, cursor="hand2",
+            command=lambda: open_link_and_close(apple_url)
+        ).pack(side="left")
+    else:
+        tk.Button(
+            row_platforms, text="Apple Music", bg="#27272a", fg="#52525b",
+            disabledforeground="#52525b", font=("Segoe UI", 8, "bold"),
+            relief="flat", padx=8, pady=4, state="disabled", cursor="arrow"
+        ).pack(side="left")
+
+    # Row 2: Try Again Button
+    row_actions = tk.Frame(btn_area, bg="#18181b")
+    row_actions.pack(fill="x")
 
     tk.Button(
-        btn_frame, text="Try Again", bg="#3b82f6", fg="#ffffff",
+        row_actions, text="Try Again", bg="#3b82f6", fg="#ffffff",
         activebackground="#2563eb", activeforeground="#ffffff",
-        font=("Segoe UI", 9, "bold"), relief="flat", padx=9, pady=5, cursor="hand2",
+        font=("Segoe UI", 8, "bold"), relief="flat", padx=10, pady=4, cursor="hand2",
         command=retry_and_close
     ).pack(side="left")
 
