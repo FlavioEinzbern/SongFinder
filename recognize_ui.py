@@ -5,7 +5,6 @@ import wave
 import array
 import json
 import warnings
-import subprocess
 
 # Silence pydub's top-level ffmpeg warning on clean Windows PCs
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -30,9 +29,11 @@ except ImportError:
 WM_COMMAND          = 0x0111
 WM_APP_LOADER_STATE = 0x0400 + 2  # WM_USER + 2 (0=Hide, 1=Listen, 2=Search, 3=Load, 4=Deep Listen)
 ID_TRAY_IDENTIFY    = 1001
-CREATE_NO_WINDOW    = 0x08000000
 
 HTTP_HEADERS = {"User-Agent": "SongFinder/1.0 (Windows; +https://github.com)"}
+
+# 5 supported languages for Backup 4 vocal recognition
+VOCAL_LANGUAGES = ["en-US", "ja-JP", "pt-BR", "es-ES", "ko-KR"]
 
 
 def notify_host_loader_state(state: int):
@@ -47,7 +48,7 @@ def notify_host_hide_loader():
 
 
 def notify_host_retry():
-    """Tells the C host to start a fresh 4-second audio capture immediately."""
+    """Tells the C host to start a fresh audio capture immediately."""
     hwnd = ctypes.windll.user32.FindWindowW("SongFinderTrayClass", "SongFinderHost")
     if hwnd:
         ctypes.windll.user32.PostMessageW(hwnd, WM_COMMAND, ID_TRAY_IDENTIFY, 0)
@@ -204,7 +205,6 @@ def enrich_with_anime_vg_databases(title: str, artist: str, album: str, cover_ur
     needs_album = (not album) or (album == "Single / Unknown Album")
     query = f"{title} {artist}".strip()
 
-    # 1. Check AnimeThemes API for exact Anime OP/ED source
     at_hit = query_animethemes_api(title) or query_animethemes_api(query)
     if at_hit.get("album"):
         if needs_album:
@@ -212,7 +212,6 @@ def enrich_with_anime_vg_databases(title: str, artist: str, album: str, cover_ur
         if not cover_url and at_hit.get("cover_url"):
             cover_url = at_hit["cover_url"]
 
-    # 2. Check VGMdb for Video Game OST album match if still missing album or cover
     if (not album or album == "Single / Unknown Album") or not cover_url:
         vgm_hit = query_vgmdb_api(query)
         if vgm_hit.get("album") and (not album or album == "Single / Unknown Album"):
@@ -220,7 +219,6 @@ def enrich_with_anime_vg_databases(title: str, artist: str, album: str, cover_ur
         if not cover_url and vgm_hit.get("cover_url"):
             cover_url = vgm_hit["cover_url"]
 
-    # 3. Check Jikan API if cover art is still missing
     if not cover_url:
         jikan_hit = query_jikan_api(album if album else query)
         if jikan_hit.get("cover_url"):
@@ -285,7 +283,6 @@ async def shazam_with_speed_fallback(shazam: Shazam, wav_bytes: bytes) -> dict:
     if track:
         return track
 
-    # Backup 2: Test speed/pitch-shifted buffers concurrently
     slower_bytes = shift_wav_speed(wav_bytes, 0.88)
     faster_bytes = shift_wav_speed(wav_bytes, 1.14)
     results = await asyncio.gather(
@@ -298,39 +295,58 @@ async def shazam_with_speed_fallback(shazam: Shazam, wav_bytes: bytes) -> dict:
     return {}
 
 
-def transcribe_vocals_single_lang(wav_bytes: bytes, lang: str) -> str:
-    """Transcribes sung vocals in a specific language using Google Web Speech."""
+def transcribe_vocals_single_lang(wav_bytes: bytes, lang: str) -> tuple:
+    """
+    Transcribes sung vocals in `lang` with `show_all=True` and returns
+    `(transcript, confidence, lang)` so the highest-confidence language wins.
+    """
     if sr is None:
-        return ""
+        return ("", 0.0, lang)
     try:
         recognizer = sr.Recognizer()
         with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
             audio_data = recognizer.record(source)
-        text = recognizer.recognize_google(audio_data, language=lang)
-        return text.strip() if isinstance(text, str) else ""
+        res = recognizer.recognize_google(audio_data, language=lang, show_all=True)
+        if isinstance(res, dict) and res.get("alternative"):
+            alts = res["alternative"]
+            top = alts[0]
+            text = (top.get("transcript") or "").strip()
+            conf = float(top.get("confidence", 0.65))
+            return (text, conf, lang)
+        elif isinstance(res, str) and res.strip():
+            return (res.strip(), 0.65, lang)
     except Exception:
-        return ""
+        pass
+    return ("", 0.0, lang)
 
 
 async def backup4_vocal_search(wav_bytes: bytes) -> dict:
     """
-    Backup 4: Transcribes vocals in English (en-US) and Japanese (ja-JP) in parallel,
-    then searches AnimeThemes, VGMdb, and YouTube Music.
+    Backup 4: Transcribes vocals across English, Japanese, Portuguese, Spanish,
+    and Korean concurrently, sorts by confidence, and searches AnimeThemes & YTMusic.
     """
-    en_text, ja_text = await asyncio.gather(
-        asyncio.to_thread(transcribe_vocals_single_lang, wav_bytes, "en-US"),
-        asyncio.to_thread(transcribe_vocals_single_lang, wav_bytes, "ja-JP")
-    )
+    tasks = [
+        asyncio.to_thread(transcribe_vocals_single_lang, wav_bytes, lang)
+        for lang in VOCAL_LANGUAGES
+    ]
+    raw_results = await asyncio.gather(*tasks)
 
     candidates = []
-    # Require at least 2 words for English or 4 characters for Japanese to filter out noise
-    if en_text and len(en_text.split()) >= 2:
-        candidates.append(en_text)
-    if ja_text and len(ja_text) >= 4:
-        candidates.append(ja_text)
+    for text, conf, lang in raw_results:
+        if not text:
+            continue
+        if lang in ("ja-JP", "ko-KR"):
+            if len(text) >= 4:
+                candidates.append((conf, lang, text))
+        else:
+            if len(text.split()) >= 2:
+                candidates.append((conf, lang, text))
 
     if not candidates:
         return {}
+
+    # Sort highest confidence score first to avoid cross-language phonetic collisions
+    candidates.sort(key=lambda item: item[0], reverse=True)
 
     ytm = None
     try:
@@ -338,16 +354,17 @@ async def backup4_vocal_search(wav_bytes: bytes) -> dict:
     except Exception:
         pass
 
-    for phrase in candidates:
-        # 1. Check AnimeThemes API directly with transcribed phrase
-        at_match = await asyncio.to_thread(query_animethemes_api, phrase)
-        if at_match.get("title"):
-            return {
-                "title": at_match["title"],
-                "artist": at_match.get("artist") or "Anime Theme Artist",
-                "album": at_match.get("album") or "",
-                "cover_url": at_match.get("cover_url") or ""
-            }
+    for _, lang, phrase in candidates:
+        # 1. Check AnimeThemes API first for Japanese/English anime themes
+        if lang in ("ja-JP", "en-US"):
+            at_match = await asyncio.to_thread(query_animethemes_api, phrase)
+            if at_match.get("title"):
+                return {
+                    "title": at_match["title"],
+                    "artist": at_match.get("artist") or "Anime Theme Artist",
+                    "album": at_match.get("album") or "",
+                    "cover_url": at_match.get("cover_url") or ""
+                }
 
         # 2. Search YouTube Music songs by transcribed lyrics
         if ytm is not None:
@@ -396,21 +413,35 @@ def build_final_result(title: str, artist: str, album: str, cover_url: str) -> d
     }
 
 
-async def identify_audio(wav_path: str, host_exe_path: str) -> dict:
+async def wait_for_deep_wav(deep_wav_path: str, max_wait_sec: float = 6.5) -> bool:
+    """Waits for the C host's simultaneous 0-10s recording to finish writing."""
+    if not deep_wav_path:
+        return False
+    elapsed = 0.0
+    step = 0.15
+    while elapsed < max_wait_sec:
+        if os.path.exists(deep_wav_path):
+            return True
+        await asyncio.sleep(step)
+        elapsed += step
+    return os.path.exists(deep_wav_path)
+
+
+async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
     """
-    Executes the full recognition chain:
-      1. Primary 4s Shazam scan
-      2. Backup 2: Speed/Pitch-Shift Retry (0.88x & 1.14x)
-      3. Backup 1: C Audio Engine 8s Deep Listen (--capture 8) + Shazam/Speed-Shift
-      4. Backup 4: Dual-Language (en-US + ja-JP) Vocal Transcription -> AnimeThemes / YTMusic
+    Executes the pipelined recognition chain:
+      1. Primary 5s Shazam scan (while C continues 5s->10s recording in background)
+      2. Backup 2: Speed/Pitch-Shift Retry (0.88x & 1.14x) on the 5s clip
+      3. Backup 1: Wait remaining ~2-3s for C's 10s cumulative clip + Shazam/Speed-Shift
+      4. Backup 4: 5-Language (en-US, ja-JP, pt-BR, es-ES, ko-KR) Vocal Transcription
       5. Stage 5: AnimeThemes / VGMdb / Jikan metadata & cover art enrichment
     """
     shazam = Shazam()
     with open(wav_path, "rb") as f:
-        wav_4s_bytes = f.read()
+        wav_5s_bytes = f.read()
 
-    # Stages 1 & 2: Primary 4s Shazam + Speed/Pitch-Shift Retry
-    track = await shazam_with_speed_fallback(shazam, wav_4s_bytes)
+    # Stages 1 & 2: Primary 5s Shazam + Speed/Pitch-Shift Retry
+    track = await shazam_with_speed_fallback(shazam, wav_5s_bytes)
     if track:
         title = track.get("title", "Unknown Title")
         artist = track.get("subtitle", "Unknown Artist")
@@ -419,23 +450,17 @@ async def identify_audio(wav_path: str, host_exe_path: str) -> dict:
         album = extract_album_from_shazam(track)
         return await asyncio.to_thread(build_final_result, title, artist, album, cover_url)
 
-    # Stage 3 (Backup 1): Trigger C Audio Engine 8-Second Deep Listen
-    active_wav_bytes = wav_4s_bytes
-    if host_exe_path and os.path.exists(host_exe_path):
-        deep_wav_path = os.path.join(os.path.dirname(os.path.abspath(wav_path)), "deep_temp.wav")
-        try:
-            notify_host_loader_state(4)  # Switch pill to purple "Deep Listen..."
-            proc = await asyncio.to_thread(
-                subprocess.run,
-                [host_exe_path, "--capture", "8", deep_wav_path],
-                creationflags=CREATE_NO_WINDOW
-            )
-            notify_host_loader_state(2)  # Switch pill back to blue "Searching..."
+    # Stage 3 (Backup 1): Wait for C's simultaneous 0-10s recording to complete
+    active_wav_bytes = wav_5s_bytes
+    if deep_wav_path:
+        notify_host_loader_state(4)  # Switch pill to purple "Deep Listen..."
+        deep_ready = await wait_for_deep_wav(deep_wav_path)
+        notify_host_loader_state(2)  # Switch pill back to blue "Searching..."
 
-            if proc.returncode == 0 and os.path.exists(deep_wav_path):
+        if deep_ready:
+            try:
                 with open(deep_wav_path, "rb") as df:
                     active_wav_bytes = df.read()
-
                 track = await shazam_with_speed_fallback(shazam, active_wav_bytes)
                 if track:
                     title = track.get("title", "Unknown Title")
@@ -444,16 +469,10 @@ async def identify_audio(wav_path: str, host_exe_path: str) -> dict:
                     cover_url = images.get("coverarthq") or images.get("coverart") or ""
                     album = extract_album_from_shazam(track)
                     return await asyncio.to_thread(build_final_result, title, artist, album, cover_url)
-        except Exception:
-            notify_host_loader_state(2)
-        finally:
-            if os.path.exists(deep_wav_path):
-                try:
-                    os.remove(deep_wav_path)
-                except OSError:
-                    pass
+            except Exception:
+                pass
 
-    # Stage 4 (Backup 4): Dual-Language (en-US / ja-JP) Vocal Transcription Fallback
+    # Stage 4 (Backup 4): 5-Language Vocal Transcription Fallback
     vocal_hit = await backup4_vocal_search(active_wav_bytes)
     if vocal_hit.get("title"):
         return await asyncio.to_thread(
@@ -587,22 +606,23 @@ def show_result_window(data: dict):
 
 def main():
     wav_path = sys.argv[1] if len(sys.argv) > 1 else "temp.wav"
-    host_exe_path = sys.argv[2] if len(sys.argv) > 2 else ""
+    deep_wav_path = sys.argv[2] if len(sys.argv) > 2 else ""
 
     if not os.path.exists(wav_path):
         notify_host_hide_loader()
         sys.exit(1)
 
     try:
-        data = asyncio.run(identify_audio(wav_path, host_exe_path))
+        data = asyncio.run(identify_audio(wav_path, deep_wav_path))
     except Exception:
         data = {"found": False}
     finally:
-        if os.path.exists(wav_path):
-            try:
-                os.remove(wav_path)
-            except OSError:
-                pass
+        for p in (wav_path, deep_wav_path):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     show_result_window(data)
 
