@@ -2,6 +2,7 @@ import sys
 import os
 import io
 import re
+import time
 import wave
 import array
 import json
@@ -37,6 +38,17 @@ HTTP_HEADERS = {"User-Agent": "SongFinder/1.0 (Windows; +https://github.com)"}
 
 # 5 supported languages for Backup 4 vocal recognition
 VOCAL_LANGUAGES = ["en-US", "ja-JP", "pt-BR", "es-ES", "ko-KR"]
+
+# 16,000 Hz * 2 bytes (16-bit) * 1 channel = 32,000 bytes per second
+PCM_BYTES_PER_SEC = 32000
+
+# Option 1 Progressive Polling Windows: (target_seconds, match_label, wait_loader_state)
+PROGRESSIVE_STEPS = [
+    (2.5,  "95% match", 1),  # Check 1 at 2.5s ("Listening...")
+    (5.0,  "95% match", 1),  # Check 2 at 5.0s ("Listening..." -> "Searching...")
+    (8.5,  "85% match", 4),  # Check 3 at 8.5s ("Deep Listen..." -> "Searching...")
+    (12.0, "85% match", 4),  # Check 4 at 12.0s ("Deep Listen..." -> "Searching...")
+]
 
 
 def get_history_file_path() -> str:
@@ -79,7 +91,6 @@ def save_song_to_history(data: dict):
         "apple_url": data.get("apple_url", "")
     }
 
-    # Avoid duplicating the exact same song consecutively at the top of the list
     if history:
         top = history[0]
         if (
@@ -101,7 +112,7 @@ def save_song_to_history(data: dict):
 
 
 def notify_host_loader_state(state: int):
-    """Updates the C bottom-right equalizer pill (0=Hide, 2=Searching, 4=Deep Listen)."""
+    """Updates the C bottom-right equalizer pill (0=Hide, 1=Listen, 2=Search, 4=Deep Listen)."""
     hwnd = ctypes.windll.user32.FindWindowW("SongFinderTrayClass", "SongFinderHost")
     if hwnd:
         ctypes.windll.user32.PostMessageW(hwnd, WM_APP_LOADER_STATE, state, 0)
@@ -155,16 +166,13 @@ def names_match(expected: str, candidate: str) -> bool:
     set_a = set(tokens_a)
     set_b = set(tokens_b)
 
-    # All words of expected appear as full words inside candidate
     if set_a and set_a.issubset(set_b):
         return True
 
-    # Candidate words are a subset of expected ONLY if candidate has >=2 words and >=60% length
     if set_b and set_b.issubset(set_a):
         if len(tokens_b) >= 2 and len(b) >= int(len(a) * 0.6):
             return True
 
-    # Primary artist token check (before feat. / comma / &)
     primary_raw = re.split(r"[,&/]|feat\.?|ft\.?|cv\.?", expected, flags=re.IGNORECASE)[0]
     primary_a = normalize_for_match(primary_raw)
     if primary_a and primary_a != a:
@@ -172,7 +180,6 @@ def names_match(expected: str, candidate: str) -> bool:
         if p_tokens and len(primary_a) >= 4 and p_tokens.issubset(set_b):
             return True
 
-    # Character similarity ratio check
     ratio = difflib.SequenceMatcher(None, a, b).ratio()
     return ratio >= 0.74
 
@@ -185,36 +192,46 @@ def extract_youtube_video_id(url: str) -> str:
     return m.group(1) if m else ""
 
 
-def normalize_wav_bytes(wav_bytes: bytes) -> bytes:
+def pcm_to_normalized_wav_bytes(pcm_bytes: bytes) -> bytes:
     """
-    Peak-normalizes 16kHz 16-bit mono PCM audio in memory to ~90% max amplitude
-    (capped at 10x gain) so quiet browser/PC volume doesn't miss in Shazam.
+    Converts raw 16kHz 16-bit mono PCM bytes into an in-memory WAV file and
+    peak-normalizes quiet audio to ~90% max amplitude (up to 10x gain).
     """
-    try:
-        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-            frames = wf.readframes(wf.getnframes())
-        samples = array.array("h")
-        samples.frombytes(frames)
-        if not samples:
-            return wav_bytes
+    even_len = len(pcm_bytes) & ~1
+    if even_len < 3200:
+        return b""
 
-        max_peak = max(abs(s) for s in samples)
-        if max_peak < 150 or max_peak >= 28000:
-            return wav_bytes
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes[:even_len])
+    max_peak = max(abs(s) for s in samples) if samples else 0
 
+    # If peak < 80, the system audio mixer is effectively silent
+    if max_peak < 80:
+        return b""
+
+    if max_peak < 28000:
         gain = min(29491.0 / max_peak, 10.0)
-        normalized = array.array(
+        samples = array.array(
             "h",
             (max(-32767, min(32767, int(s * gain))) for s in samples)
         )
 
-        out_io = io.BytesIO()
-        with wave.open(out_io, "wb") as wf_out:
-            wf_out.setnchannels(1)
-            wf_out.setsampwidth(2)
-            wf_out.setframerate(16000)
-            wf_out.writeframes(normalized.tobytes())
-        return out_io.getvalue()
+    out_io = io.BytesIO()
+    with wave.open(out_io, "wb") as wf_out:
+        wf_out.setnchannels(1)
+        wf_out.setsampwidth(2)
+        wf_out.setframerate(16000)
+        wf_out.writeframes(samples.tobytes())
+    return out_io.getvalue()
+
+
+def normalize_wav_bytes(wav_bytes: bytes) -> bytes:
+    """Peak-normalizes an existing WAV buffer in memory."""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            pcm = wf.readframes(wf.getnframes())
+        out = pcm_to_normalized_wav_bytes(pcm)
+        return out if out else wav_bytes
     except Exception:
         return wav_bytes
 
@@ -358,7 +375,6 @@ def resolve_streaming_and_songlink(
     query = f"{artist} {title}".strip()
     encoded_q = urllib.parse.quote_plus(query)
 
-    # 1. Verify / Resolve Apple Music via Apple's keyless iTunes Search API
     if not apple_url:
         itunes_data = fetch_json(
             f"https://itunes.apple.com/search?term={encoded_q}&entity=song&limit=5",
@@ -370,7 +386,6 @@ def resolve_streaming_and_songlink(
                 if apple_url:
                     break
 
-    # 2. Query Songlink using Apple Music URL
     if apple_url and (not spotify_url or "/search/" in spotify_url or (shazam_apple and not yt_url)):
         sl_url = f"https://api.song.link/v1-alpha.1/links?url={urllib.parse.quote_plus(apple_url)}"
         sl_data = fetch_json(sl_url, timeout=2.5)
@@ -380,7 +395,6 @@ def resolve_streaming_and_songlink(
             if sp_link and (not spotify_url or "/search/" in spotify_url):
                 spotify_url = sp_link
 
-            # Only trust Songlink's direct YouTube override if Apple URL came from Shazam's fingerprint
             if shazam_apple:
                 sl_yt = platforms.get("youtube", {}).get("url", "")
                 if sl_yt and not yt_url:
@@ -389,7 +403,6 @@ def resolve_streaming_and_songlink(
                 if sl_ytm:
                     ytm_url = sl_ytm
 
-    # 3. If Spotify is still unresolved, verify commercial streaming presence via Deezer API
     if not spotify_url:
         dz_data = fetch_json(f"https://api.deezer.com/search?q={encoded_q}&limit=5", timeout=2.5)
         for item in dz_data.get("data", []):
@@ -473,14 +486,12 @@ def resolve_youtube_links(
         ytm = YTMusic()
         verified_hit = None
 
-        # Pass 1: Check top 5 licensed "songs"
         song_hits = ytm.search(base_query, filter="songs", limit=5) or []
         for hit in song_hits:
             if is_verified_youtube_hit(hit, title, artist, album, is_video=False):
                 verified_hit = hit
                 break
 
-        # Pass 2: Check top 5 standard YouTube "videos"
         if not verified_hit:
             video_hits = ytm.search(base_query, filter="videos", limit=5) or []
             for hit in video_hits:
@@ -488,7 +499,6 @@ def resolve_youtube_links(
                     verified_hit = hit
                     break
 
-        # Pass 3: Disambiguate using enriched Anime / Game OST Album name
         if not verified_hit and album and album != "Single / Unknown Album":
             album_query = f"{title} {album}".strip()
             album_hits = ytm.search(album_query, filter="videos", limit=5) or []
@@ -647,6 +657,8 @@ def enrich_with_anime_vg_databases(title: str, artist: str, album: str, cover_ur
 
 async def shazam_recognize_bytes(shazam: Shazam, wav_bytes: bytes) -> dict:
     """Queries Shazam with raw WAV bytes and returns the track dict if matched."""
+    if not wav_bytes:
+        return {}
     try:
         if hasattr(shazam, "recognize"):
             out = await shazam.recognize(wav_bytes)
@@ -660,8 +672,10 @@ async def shazam_recognize_bytes(shazam: Shazam, wav_bytes: bytes) -> dict:
 async def shazam_speed_shift_only(shazam: Shazam, wav_bytes: bytes) -> dict:
     """
     Runs linear-interpolated Speed-Shift Retry (0.88x Nightcore fix and 1.14x Slowed+Reverb fix)
-    in parallel after clean 5s and 10s scans have been checked.
+    in parallel after progressive normal scans have been checked.
     """
+    if not wav_bytes:
+        return {}
     slower_bytes = shift_wav_speed(wav_bytes, 0.88)
     faster_bytes = shift_wav_speed(wav_bytes, 1.14)
     results = await asyncio.gather(
@@ -679,7 +693,7 @@ def transcribe_vocals_single_lang(wav_bytes: bytes, lang: str) -> tuple:
     Transcribes sung vocals in `lang` with `show_all=True` and returns
     `(transcript, confidence, lang)`.
     """
-    if sr is None:
+    if sr is None or not wav_bytes:
         return ("", 0.0, lang)
     try:
         recognizer = sr.Recognizer()
@@ -703,6 +717,8 @@ async def backup4_vocal_search(wav_bytes: bytes) -> dict:
     Requires confidence >= 0.85 and >= 4 words (>= 8 chars for JA/KO)
     and verifies overlap between the transcribed phrase and matched track title.
     """
+    if not wav_bytes:
+        return {}
     tasks = [
         asyncio.to_thread(transcribe_vocals_single_lang, wav_bytes, lang)
         for lang in VOCAL_LANGUAGES
@@ -813,63 +829,80 @@ def build_final_result(
     }
 
 
-async def wait_for_deep_wav(deep_wav_path: str, max_wait_sec: float = 6.5) -> bool:
-    """Waits for the C host's simultaneous 0-10s recording to finish writing."""
-    if not deep_wav_path:
-        return False
-    elapsed = 0.0
-    step = 0.15
-    while elapsed < max_wait_sec:
-        if os.path.exists(deep_wav_path):
-            return True
-        await asyncio.sleep(step)
-        elapsed += step
-    return os.path.exists(deep_wav_path)
-
-
-async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
+async def read_progressive_pcm_slice(pcm_path: str, target_sec: float, start_monotonic: float) -> bytes:
     """
-    Pipeline Order:
-      1. Shazam (5s) [Normalized]               -> 95% match
-      2. Shazam Deep Listen (10s) [Normalized]  -> 85% match
-      3. Shazam Speed-Shift (0.88x & 1.14x)     -> 60% match
-      4. Vocal Lyrics (Strict >=0.85 & >=4 wds) -> 50% match
+    Waits until `stream.pcm` reaches `target_sec * 32,000` bytes (or wall-clock timeout
+    if system audio is silent) and returns the raw PCM byte slice.
+    """
+    target_bytes = int(target_sec * PCM_BYTES_PER_SEC)
+    deadline = start_monotonic + target_sec + 0.45
+
+    while True:
+        try:
+            if os.path.exists(pcm_path) and os.path.getsize(pcm_path) >= target_bytes:
+                break
+        except OSError:
+            pass
+
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.08)
+
+    try:
+        with open(pcm_path, "rb") as f:
+            return f.read(target_bytes)
+    except Exception:
+        return b""
+
+
+async def identify_audio(audio_path: str) -> dict:
+    """
+    Option 1 Progressive Real-Time Polling Pipeline:
+      - Polls live `stream.pcm` at 2.5s (95%), 5.0s (95%), 8.5s (85%), and 12.0s (85%).
+      - If all 4 progressive checks miss, runs Speed-Shift (60%) and Vocal Lyrics (50%).
+      - Also supports direct `.wav` files if tested standalone via CLI.
     """
     shazam = Shazam()
-    with open(wav_path, "rb") as f:
-        wav_5s_raw = f.read()
 
-    norm_5s_bytes = await asyncio.to_thread(normalize_wav_bytes, wav_5s_raw)
+    # Standalone CLI `.wav` test fallback
+    if audio_path.lower().endswith(".wav"):
+        with open(audio_path, "rb") as f:
+            raw_wav = f.read()
+        norm_wav = await asyncio.to_thread(normalize_wav_bytes, raw_wav)
+        track = await shazam_recognize_bytes(shazam, norm_wav)
+        if track:
+            title = track.get("title", "Unknown Title")
+            artist = track.get("subtitle", "Unknown Artist")
+            images = track.get("images", {})
+            cover_url = images.get("coverarthq") or images.get("coverart") or ""
+            album = extract_album_from_shazam(track)
+            hub_links = extract_streaming_from_shazam(track)
+            return await asyncio.to_thread(
+                build_final_result,
+                title, artist, album, cover_url, "95% match",
+                hub_links["apple_url"], hub_links["spotify_url"], hub_links["yt_url"]
+            )
+        return {"found": False}
 
-    # Pass 1: Primary 5s Shazam Scan -> 95% match
-    track = await shazam_recognize_bytes(shazam, norm_5s_bytes)
-    if track:
-        title = track.get("title", "Unknown Title")
-        artist = track.get("subtitle", "Unknown Artist")
-        images = track.get("images", {})
-        cover_url = images.get("coverarthq") or images.get("coverart") or ""
-        album = extract_album_from_shazam(track)
-        hub_links = extract_streaming_from_shazam(track)
-        return await asyncio.to_thread(
-            build_final_result,
-            title, artist, album, cover_url,
-            "95% match",
-            hub_links["apple_url"], hub_links["spotify_url"], hub_links["yt_url"]
-        )
+    # Live Progressive Polling on `stream.pcm` (2.5s -> 5.0s -> 8.5s -> 12.0s)
+    start_time = time.monotonic()
+    latest_norm_wav = b""
+    last_checked_len = 0
 
-    # Pass 2: Wait for Clean 10s Deep Listen Recording -> 85% match
-    active_norm_bytes = norm_5s_bytes
-    if deep_wav_path:
-        notify_host_loader_state(4)  # Switch pill to purple "Deep Listen..."
-        deep_ready = await wait_for_deep_wav(deep_wav_path)
-        notify_host_loader_state(2)  # Switch pill back to blue "Searching..."
+    for target_sec, match_label, wait_loader_state in PROGRESSIVE_STEPS:
+        notify_host_loader_state(wait_loader_state)
+        pcm_slice = await read_progressive_pcm_slice(audio_path, target_sec, start_time)
 
-        if deep_ready:
-            try:
-                with open(deep_wav_path, "rb") as df:
-                    wav_10s_raw = df.read()
-                active_norm_bytes = await asyncio.to_thread(normalize_wav_bytes, wav_10s_raw)
-                track = await shazam_recognize_bytes(shazam, active_norm_bytes)
+        if target_sec >= 5.0:
+            notify_host_loader_state(2)  # Show blue "Searching..." during network query
+
+        # Only query Shazam if new non-silent audio frames arrived since the previous step
+        if len(pcm_slice) - last_checked_len >= 16000:
+            last_checked_len = len(pcm_slice)
+            norm_wav = await asyncio.to_thread(pcm_to_normalized_wav_bytes, pcm_slice)
+            if norm_wav:
+                latest_norm_wav = norm_wav
+                track = await shazam_recognize_bytes(shazam, norm_wav)
                 if track:
                     title = track.get("title", "Unknown Title")
                     artist = track.get("subtitle", "Unknown Artist")
@@ -880,14 +913,17 @@ async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
                     return await asyncio.to_thread(
                         build_final_result,
                         title, artist, album, cover_url,
-                        "85% match",
+                        match_label,
                         hub_links["apple_url"], hub_links["spotify_url"], hub_links["yt_url"]
                     )
-            except Exception:
-                pass
 
-    # Pass 3: Shazam Speed-Shift Retry (0.88x & 1.14x) -> 60% match
-    track = await shazam_speed_shift_only(shazam, active_norm_bytes)
+    if not latest_norm_wav:
+        return {"found": False}
+
+    notify_host_loader_state(2)
+
+    # Backup Pass 1: Shazam Speed-Shift Retry (0.88x & 1.14x) -> 60% match
+    track = await shazam_speed_shift_only(shazam, latest_norm_wav)
     if track:
         title = track.get("title", "Unknown Title")
         artist = track.get("subtitle", "Unknown Artist")
@@ -902,8 +938,8 @@ async def identify_audio(wav_path: str, deep_wav_path: str) -> dict:
             hub_links["apple_url"], hub_links["spotify_url"], hub_links["yt_url"]
         )
 
-    # Pass 4: Strict 5-Language Vocal Lyrics Search -> 50% match
-    vocal_hit = await backup4_vocal_search(active_norm_bytes)
+    # Backup Pass 2: Strict 5-Language Vocal Lyrics Search -> 50% match
+    vocal_hit = await backup4_vocal_search(latest_norm_wav)
     if vocal_hit.get("title"):
         return await asyncio.to_thread(
             build_final_result,
@@ -1020,7 +1056,6 @@ def show_result_window(data: dict):
         font=("Segoe UI", 9), anchor="w", wraplength=310, justify="left"
     ).pack(fill="x", pady=(1, 2))
 
-    # Percentage-Only Match Indicator ("95% match", "85% match", "60% match", or "50% match")
     match_label = data.get("match_label", "95% match")
     badge_color = get_match_badge_color(match_label)
 
@@ -1256,24 +1291,12 @@ def main():
         show_history_window()
         return
 
-    wav_path = sys.argv[1] if len(sys.argv) > 1 else "temp.wav"
-    deep_wav_path = sys.argv[2] if len(sys.argv) > 2 else ""
-
-    if not os.path.exists(wav_path):
-        notify_host_hide_loader()
-        sys.exit(1)
+    stream_path = sys.argv[1] if len(sys.argv) > 1 else "stream.pcm"
 
     try:
-        data = asyncio.run(identify_audio(wav_path, deep_wav_path))
+        data = asyncio.run(identify_audio(stream_path))
     except Exception:
         data = {"found": False}
-    finally:
-        for p in (wav_path, deep_wav_path):
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
 
     if data.get("found"):
         save_song_to_history(data)
