@@ -4,9 +4,9 @@ REM Add local portable w64devkit GCC and windres to PATH for this build session
 set "PATH=%~dp0w64devkit\bin;%PATH%"
 
 echo [1/5] Building recognize_ui.py in fast --onedir mode...
-pyinstaller --onedir --noconsole --clean --collect-all shazamio --collect-all ytmusicapi --name recognize_ui recognize_ui.py
+pyinstaller --onedir --noconsole --clean --collect-all shazamio --collect-all ytmusicapi --collect-all speech_recognition --name recognize_ui recognize_ui.py
 if %ERRORLEVEL% NEQ 0 (
-    echo PyInstaller step failed. Make sure you ran: pip install pyinstaller
+    echo PyInstaller step failed. Make sure you ran: pip install pyinstaller SpeechRecognition
     pause
     exit /b 1
 )
